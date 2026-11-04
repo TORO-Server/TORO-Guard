@@ -155,7 +155,8 @@ window.marumasign3d = {disable(){ fetch('/disabled' + location.search + '&w=' + 
 	defer srv.Close()
 
 	s := &Shooter{URL: srv.URL, Browser: browser, Chrome: chrome, W: 640, H: 360, MaxWait: 5 * time.Second}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	// 手元の Chromium は、撮るたびに起動する。マシンが忙しいと 1 回に 1 分近くかかる
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 	out := filepath.Join(t.TempDir(), "shot.png")
 	for i := 0; i < 2; i++ { // 2 回続けて撮れる (前のコンテキストが残らない)
