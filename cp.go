@@ -312,15 +312,21 @@ func (c *CP) Stats(ctx context.Context, user UserInfo, from, to int64) (*Stats, 
 	if err != nil {
 		return nil, err
 	}
+	type typeCount struct{ t, n int }
+	var tops []typeCount
 	for mrows.Next() {
-		var t, n int
-		if err := mrows.Scan(&t, &n); err != nil {
+		var tc typeCount
+		if err := mrows.Scan(&tc.t, &tc.n); err != nil {
 			mrows.Close()
 			return nil, err
 		}
-		s.TopBreaks = append(s.TopBreaks, MatCount{Material: trimNS(c.Material(ctx, t)), Count: n})
+		tops = append(tops, tc)
 	}
 	mrows.Close()
+	// 名前を引くクエリは、行を読み終えて接続を返してから (接続の上限とキャッシュのロックで止まらないように)
+	for _, tc := range tops {
+		s.TopBreaks = append(s.TopBreaks, MatCount{Material: trimNS(c.Material(ctx, tc.t)), Count: tc.n})
+	}
 
 	crows, err := c.db.QueryContext(ctx,
 		"SELECT x, z, COUNT(*), MIN(y), MAX(y) FROM "+c.p+"block WHERE user = ? AND time BETWEEN ? AND ? AND wid = ? AND action = 0 GROUP BY x, z LIMIT 300000", user.ID, from, to, s.Wid)
@@ -355,9 +361,15 @@ func (c *CP) Stats(ctx context.Context, user UserInfo, from, to int64) (*Stats, 
 }
 
 // RolledBack は [from, to] の変更のうち、ロールバックされた数と全部の数。
-func (c *CP) RolledBack(ctx context.Context, userID int, from, to int64) (done, total int, err error) {
-	err = c.db.QueryRowContext(ctx,
-		"SELECT COALESCE(SUM(CASE WHEN rolled_back = 1 THEN 1 ELSE 0 END), 0), COUNT(*) FROM "+c.p+"block WHERE user = ? AND time BETWEEN ? AND ? AND action IN (0,1)", userID, from, to).Scan(&done, &total)
+// ロールバックはワールドを指定して行うので、数えるのも同じワールドだけ (world が空なら、すべて)。
+func (c *CP) RolledBack(ctx context.Context, userID int, world string, from, to int64) (done, total int, err error) {
+	q := "SELECT COALESCE(SUM(CASE WHEN rolled_back = 1 THEN 1 ELSE 0 END), 0), COUNT(*) FROM " + c.p + "block WHERE user = ? AND time BETWEEN ? AND ? AND action IN (0,1)"
+	args := []any{userID, from, to}
+	if world != "" {
+		q += " AND wid IN (SELECT id FROM " + c.p + "world WHERE world = ?)"
+		args = append(args, world)
+	}
+	err = c.db.QueryRowContext(ctx, q, args...).Scan(&done, &total)
 	return
 }
 

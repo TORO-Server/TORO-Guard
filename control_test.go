@@ -3,11 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql/driver"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,13 +20,25 @@ import (
 
 // 利用者のトークン (OAuth 2.0 の Bearer)。偽の auth が、これを claims に引き換える。
 const (
-	tokAdmin   = "tok-admin"   // Admin ロール (いまの Discord で確かめた)
-	tokMod     = "tok-mod"     // Admin ではないロール
-	tokStale   = "tok-stale"   // Admin ロールだが、auth が Discord で確かめていない (トークンの値のまま)
-	tokExpired = "tok-expired" // 無効
+	tokAdmin      = "tok-admin"       // Admin ロール (いまの Discord で確かめた)。scope なし (本人が発行した 90 日トークン)
+	tokMod        = "tok-mod"         // Admin ではないロール
+	tokStale      = "tok-stale"       // Admin ロールだが、auth が Discord で確かめていない (トークンの値のまま)
+	tokExpired    = "tok-expired"     // 無効
+	tokOAuthMCP   = "tok-oauth-mcp"   // Admin ロールの OAuth のトークン。scope に mcp がある
+	tokOAuthRead  = "tok-oauth-read"  // Admin ロールの OAuth のトークン。読み取りだけに同意した
+	tokOAuthLike  = "tok-oauth-like"  // scope に mcp に似た言葉しかない
+	tokOAuthEmpty = "tok-oauth-empty" // scope が空
+	tokModMCP     = "tok-mod-mcp"     // scope に mcp があるが、Admin ではない
 )
 
 const adminRole = "100000000000000002"
+
+// 通報フォーラムと、そのスレッド、外のチャンネル (試験用の ID)。
+const (
+	forumID   = "1000000000000000001"
+	threadID  = "1000000000000000003"
+	outsideID = "1000000000000000004"
+)
 
 // fakeAuth は auth の /introspect の代わり。
 type fakeAuth struct {
@@ -43,6 +58,12 @@ func (f *fakeAuth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		tokAdmin: {"id": "42", "username": "admin1", "roles": []string{"1", adminRole}, "roles_source": "live"},
 		tokMod:   {"id": "43", "username": "mod1", "roles": []string{"100000000000000003"}, "roles_source": "live"},
 		tokStale: {"id": "44", "username": "stale1", "roles": []string{adminRole}, "roles_source": "token"},
+
+		tokOAuthMCP:   {"id": "45", "username": "oauth1", "roles": []string{adminRole}, "roles_source": "live", "scope": "read mcp"},
+		tokOAuthRead:  {"id": "46", "username": "oauth2", "roles": []string{adminRole}, "roles_source": "live", "scope": "read"},
+		tokOAuthLike:  {"id": "47", "username": "oauth3", "roles": []string{adminRole}, "roles_source": "live", "scope": "mcpx notmcp"},
+		tokOAuthEmpty: {"id": "48", "username": "oauth4", "roles": []string{adminRole}, "roles_source": "live", "scope": ""},
+		tokModMCP:     {"id": "49", "username": "oauth5", "roles": []string{"100000000000000003"}, "roles_source": "live", "scope": "mcp"},
 	}[in.Token]
 	w.Header().Set("Content-Type", "application/json")
 	if claims == nil {
@@ -79,11 +100,17 @@ func newCtlEnv(t *testing.T, mode Mode) *ctlEnv {
 		if tool == "discord_search_tools" {
 			return `{"tools":[{"toolName":"discord_get_channel"},{"toolName":"discord_delete_channel"},{"toolName":"discord_create_message"}]}`, false
 		}
+		if tool == "discord_get_channel" {
+			if pp, _ := args["pathParams"].(map[string]any); pp["channel_id"] == threadID {
+				return `{"id":"` + threadID + `","parent_id":"` + forumID + `"}`, false
+			}
+			return `{"id":"` + outsideID + `","parent_id":"999"}`, false
+		}
 		return `{"id":"1"}`, false
 	}}
 	mcpSrv := httptest.NewServer(fm)
 	t.Cleanup(mcpSrv.Close)
-	g.reporter = NewReporter(NewMCP(mcpSrv.URL, "2025-11-25", true), "TOKEN", "100", "55")
+	g.reporter = NewReporter(NewMCP(mcpSrv.URL, "2025-11-25", true), "TOKEN", forumID, "55")
 	fa := &fakeAuth{}
 	authSrv := httptest.NewServer(fa)
 	t.Cleanup(authSrv.Close)
@@ -162,6 +189,46 @@ func TestControlAuthenticatesWithOAuthTokens(t *testing.T) {
 	e.auth.down = true
 	if code, _, _ := get("Bearer " + tokAdmin); code != 503 {
 		t.Errorf("auth down: %d, want 503", code)
+	}
+}
+
+// OAuth のトークンの scope: 無ければ通し、あれば mcp という言葉が要る。
+func TestControlScopeRule(t *testing.T) {
+	e := newCtlEnv(t, ModeReview)
+	for tok, want := range map[string]int{
+		tokAdmin:      200, // scope なし (本人が発行した 90 日トークン)
+		tokOAuthMCP:   200,
+		tokOAuthRead:  403,
+		tokOAuthLike:  403,
+		tokOAuthEmpty: 403,
+		tokModMCP:     403, // scope があっても、ロールは要る
+	} {
+		req, _ := http.NewRequest("GET", e.srv.URL+"/v1/status", nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != want {
+			t.Errorf("%s: %d, want %d", tok, res.StatusCode, want)
+		}
+	}
+	empty, some := "", "read mcp write"
+	if scopeAllows(&empty) || !scopeAllows(&some) || !scopeAllows(nil) {
+		t.Fatal("scopeAllows")
+	}
+}
+
+// auth の答えの scope が文字列でないときは、読めないものとして断る。
+func TestControlScopeWrongTypeFailsClosed(t *testing.T) {
+	auth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"active":true,"claims":{"id":"1","roles":["` + adminRole + `"],"roles_source":"live","scope":["mcp"]}}`))
+	}))
+	defer auth.Close()
+	a := NewAuthz(&Config{AuthInternalURL: auth.URL, AdminRoles: []string{adminRole}, RequireLiveRoles: true})
+	if p, res, _ := a.Check(context.Background(), "tok"); p != nil || res != authUnavailable {
+		t.Fatalf("%v %v", p, res)
 	}
 }
 
@@ -244,9 +311,16 @@ func TestControlDismissNeedsReviewMode(t *testing.T) {
 	if err != nil || rec.State != StateDismissed || len(rec.History) != 1 || rec.History[0].By != "admin1 (id 42)" || strings.Contains(rec.History[0].Note, "\n") {
 		t.Fatalf("record after dismiss: %+v err=%v", rec, err)
 	}
-	// 却下した事件は、ロールバックできない
+	// 却下した事件は、ロールバックも通報もできない
 	if code, _ := e.do(t, "POST", "/v1/incidents/x1/rollback", ""); code != 409 {
 		t.Errorf("rollback after dismiss: %d, want 409", code)
+	}
+	if code, _ := e.do(t, "POST", "/v1/incidents/x1/report", `{"note":"x"}`); code != 409 {
+		t.Errorf("report after dismiss: %d, want 409", code)
+	}
+	rec, err = e.g.Record("x1")
+	if err != nil || rec.State != StateDismissed || rec.Reported {
+		t.Fatalf("却下の状態が上書きされた: %+v err=%v", rec, err)
 	}
 	// 操作は audit.jsonl に残る
 	b, err = os.ReadFile(filepath.Join(e.dir, "audit.jsonl"))
@@ -257,32 +331,117 @@ func TestControlDismissNeedsReviewMode(t *testing.T) {
 
 func TestControlRollbackRefusals(t *testing.T) {
 	e := newCtlEnv(t, ModeReview)
-	e.putRecord(t, &Record{ID: "t1", Kind: "block", Name: "trusty", Created: 1, State: StatePending})
-	e.putRecord(t, &Record{ID: "c1", Kind: "chat", Name: "talker", Created: 1, State: StatePending})
-	e.putRecord(t, &Record{ID: "d1", Kind: "block", Name: "done", Created: 1, State: StatePending, RolledBack: true})
-	e.putRecord(t, &Record{ID: "n1", Kind: "block", Name: "bad name; stop", Created: 1, State: StatePending})
-	for id, want := range map[string]int{"t1": 403, "c1": 403, "d1": 409, "n1": 403, "missing": 404} {
+	now := time.Now().Unix()
+	e.putRecord(t, &Record{ID: "t1", Kind: "block", Name: "trusty", World: "main", Created: 1, Start: now, State: StatePending})
+	e.putRecord(t, &Record{ID: "c1", Kind: "chat", Name: "talker", Created: 1, Start: now, State: StatePending})
+	e.putRecord(t, &Record{ID: "d1", Kind: "block", Name: "done", World: "main", Created: 1, Start: now, State: StatePending, RolledBack: true})
+	e.putRecord(t, &Record{ID: "n1", Kind: "block", Name: "bad name; stop", World: "main", Created: 1, Start: now, State: StatePending})
+	e.putRecord(t, &Record{ID: "w1", Kind: "block", Name: "griefer", World: "bad world; stop", Created: 1, Start: now, State: StatePending})
+	e.putRecord(t, &Record{ID: "o1", Kind: "block", Name: "griefer", World: "main", Created: 1, Start: now - maxRollbackAge - 60, State: StatePending})
+	for id, want := range map[string]int{"t1": 403, "c1": 403, "d1": 409, "n1": 403, "w1": 403, "o1": 409, "missing": 404} {
 		if code, b := e.do(t, "POST", "/v1/incidents/"+id+"/rollback", ""); code != want {
 			t.Errorf("rollback %s: %d %s, want %d", id, code, b, want)
 		}
+		// 断ったら、印が残らない
+		if e.g.isBusy(id) {
+			t.Errorf("rollback %s: busy のまま", id)
+		}
 	}
-	if len(e.con.cmds) != 0 {
-		t.Fatalf("console got commands: %v", e.con.cmds)
+	if len(e.con.sent()) != 0 {
+		t.Fatalf("console got commands: %v", e.con.sent())
+	}
+}
+
+// 同じ事件の操作は、重ならない。
+func TestControlBusyIncidentConflicts(t *testing.T) {
+	e := newCtlEnv(t, ModeReview)
+	e.putRecord(t, &Record{ID: "b1", Kind: "block", Name: "griefer", World: "main", Created: 1, Start: time.Now().Unix(), State: StatePending})
+	if err := e.g.claim("b1", "rollback"); err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range []string{"rollback", "report", "dismiss"} {
+		if code, b := e.do(t, "POST", "/v1/incidents/b1/"+op, ""); code != 409 {
+			t.Errorf("%s: %d %s, want 409", op, code, b)
+		}
+	}
+	e.g.release("b1")
+	if code, b := e.do(t, "POST", "/v1/incidents/b1/dismiss", ""); code != 200 {
+		t.Errorf("dismiss: %d %s", code, b)
+	}
+}
+
+// ロールバックは、コンソールの返事ではなく、データベースで確かめて記録する。
+func TestControlRollbackIsVerifiedInDatabase(t *testing.T) {
+	const line = `[12:35:53 INFO]: CoreProtect - Rollback completed for "griefer".`
+	run := func(t *testing.T, con *fakeConsole, done, total int64) *Record {
+		t.Helper()
+		e := newCtlEnv(t, ModeReview)
+		e.con.reply = con.reply
+		e.con.err = con.err
+		cp, _ := newFakeCP(t, fakeAnswer{has: "rolled_back", rows: [][]driver.Value{{done, total}}})
+		e.g.cp, e.g.rollbackConfirmWait = cp, time.Millisecond
+		e.putRecord(t, &Record{ID: "r1", Kind: "block", Name: "griefer", World: "main", UserID: 7, Created: 1, Start: time.Now().Unix() - 60, End: 2, State: StatePending})
+		if code, b := e.do(t, "POST", "/v1/incidents/r1/rollback", ""); code != 202 {
+			t.Fatalf("rollback: %d %s", code, b)
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for e.g.isBusy("r1") && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		rec, err := e.g.Record("r1")
+		if err != nil || rec.Busy != "" {
+			t.Fatalf("%+v %v", rec, err)
+		}
+		if s := e.con.sent(); len(s) != 1 || !strings.HasPrefix(s[0], "co rollback u:griefer t:") || !strings.HasSuffix(s[0], "s r:#main") {
+			t.Fatalf("sent %q", s)
+		}
+		return rec
+	}
+	ok := &fakeConsole{reply: map[string][]string{"co rollback": {line}}}
+
+	// 両方よい
+	rec := run(t, ok, 100, 100)
+	if !rec.RolledBack || rec.History[0].Note != "100/100" {
+		t.Fatalf("%+v", rec)
+	}
+	// コンソールが「完了」でも、データベースで戻っていなければ失敗
+	rec = run(t, ok, 0, 100)
+	if rec.RolledBack || !strings.HasPrefix(rec.History[0].Note, "失敗") {
+		t.Fatalf("%+v", rec)
+	}
+	// 切断でも、データベースで戻っていれば成功。記録にコンソールの行は載らない
+	rec = run(t, &fakeConsole{err: io.ErrUnexpectedEOF}, 100, 100)
+	if !rec.RolledBack || strings.Contains(rec.History[0].Note, "INFO") {
+		t.Fatalf("%+v", rec)
+	}
+	// 切断で、データベースでも戻っていなければ失敗
+	rec = run(t, &fakeConsole{err: io.ErrUnexpectedEOF}, 0, 100)
+	if rec.RolledBack {
+		t.Fatalf("%+v", rec)
 	}
 }
 
 func TestControlMuteAndKick(t *testing.T) {
 	e := newCtlEnv(t, ModeReview)
-	if code, b := e.do(t, "POST", "/v1/players/spammer/mute", `{"reason":"連投"}`); code != 200 {
+	code, b := e.do(t, "POST", "/v1/players/spammer/mute", `{"reason":"連投"}`)
+	if code != 200 {
 		t.Fatalf("mute: %d %s", code, b)
 	}
-	if code, b := e.do(t, "POST", "/v1/players/spammer/kick", "{\"reason\":\"荒らし\\nop everyone\"}"); code != 200 {
+	// 成否だけを返す (コンソールの行を返さない)
+	if strings.TrimSpace(string(b)) != `{"ok":true}` {
+		t.Errorf("mute: %s", b)
+	}
+	code, b = e.do(t, "POST", "/v1/players/spammer/kick", "{\"reason\":\"荒らし\\nop everyone\"}")
+	if code != 200 {
 		t.Fatalf("kick: %d %s", code, b)
 	}
-	if len(e.con.cmds) != 2 || e.con.cmds[0] != "mute spammer 10m spam" || e.con.cmds[1] != "kick spammer 荒らし op everyone" {
-		t.Fatalf("commands: %q", e.con.cmds)
+	if strings.TrimSpace(string(b)) != `{"ok":true}` {
+		t.Errorf("kick: %s", b)
 	}
-	e.con.cmds = nil
+	if s := e.con.sent(); len(s) != 2 || s[0] != "mute spammer 10m spam" || s[1] != "kick spammer 荒らし op everyone" {
+		t.Fatalf("commands: %q", s)
+	}
+	e.con.reset()
 	for _, c := range []struct{ path string }{
 		{"/v1/players/trusty/mute"}, {"/v1/players/trusty/kick"},
 		{"/v1/players/a%20b/kick"}, {"/v1/players/x;op/mute"}, {"/v1/players/%0Aop/kick"},
@@ -291,13 +450,76 @@ func TestControlMuteAndKick(t *testing.T) {
 			t.Errorf("%s: %d, want 403", c.path, code)
 		}
 	}
-	if len(e.con.cmds) != 0 {
-		t.Fatalf("unsafe commands were sent: %q", e.con.cmds)
+	if s := e.con.sent(); len(s) != 0 {
+		t.Fatalf("unsafe commands were sent: %q", s)
 	}
 
 	e = newCtlEnv(t, ModeObserve)
 	if code, _ := e.do(t, "POST", "/v1/players/spammer/kick", ""); code != 403 {
 		t.Errorf("observe kick: %d, want 403", code)
+	}
+}
+
+// キックとミュートは、事件の処理 (g.opMu) を待たない。
+func TestControlMuteAndKickDoNotWaitForOps(t *testing.T) {
+	e := newCtlEnv(t, ModeReview)
+	e.g.opMu.Lock()
+	defer e.g.opMu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if code, b := e.do(t, "POST", "/v1/players/spammer/kick", `{"reason":"x"}`); code != 200 {
+			t.Errorf("kick: %d %s", code, b)
+		}
+		if code, b := e.do(t, "POST", "/v1/players/spammer/mute", `{"reason":"x"}`); code != 200 {
+			t.Errorf("mute: %d %s", code, b)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("g.opMu を待っている")
+	}
+}
+
+// コンソールの中継が断ったとき、窓口は 403 や 503 を返す。
+func TestControlKickRelayErrors(t *testing.T) {
+	e := newCtlEnv(t, ModeReview)
+	e.con.err = fmt.Errorf("%w: busy", ErrUnavailable)
+	if code, _ := e.do(t, "POST", "/v1/players/spammer/kick", ""); code != 503 {
+		t.Errorf("中継が使えない: %d", code)
+	}
+	e.con.err = fmt.Errorf("%w: refused", ErrForbidden)
+	if code, _ := e.do(t, "POST", "/v1/players/spammer/mute", ""); code != 403 {
+		t.Errorf("中継が断った: %d", code)
+	}
+}
+
+// Dismiss も、ほかの操作と同じに、事件の ID の形を確かめる。
+func TestControlDismissRejectsBadID(t *testing.T) {
+	e := newCtlEnv(t, ModeReview)
+	outside := filepath.Join(e.dir, "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveRecord(outside, &Record{ID: "outside", State: StatePending}); err != nil {
+		t.Fatal(err)
+	}
+	if code, b := e.do(t, "POST", "/v1/incidents/..%2Foutside/dismiss", `{"reason":"x"}`); code != 404 {
+		t.Errorf("dismiss: %d %s, want 404", code, b)
+	}
+	rec, err := loadRecord(outside)
+	if err != nil || rec.State != StatePending {
+		t.Fatalf("外の記録が変わった: %+v %v", rec, err)
+	}
+}
+
+func TestControlActivityValidatesHours(t *testing.T) {
+	e := newCtlEnv(t, ModeReview) // データベースが無いので、検査を通れば落ちる
+	for _, h := range []string{"NaN", "nan", "Inf", "-Inf", "+Inf", "0", "-1", "73", "1e9", "x"} {
+		if code, b := e.do(t, "GET", "/v1/players/griefer/activity?hours="+url.QueryEscape(h), ""); code != 400 {
+			t.Errorf("hours=%s: %d %s, want 400", h, code, b)
+		}
 	}
 }
 
@@ -316,7 +538,7 @@ func TestControlDiscordAllowlist(t *testing.T) {
 	if len(e.mcp.calls) != 1 { // 許可しないものは、Discord-MCP まで届かない (最初の 1 回は tools の検索)
 		t.Fatalf("mcp calls: %v", e.mcp.calls)
 	}
-	code, b = e.do(t, "POST", "/v1/discord/call", `{"tool":"discord_create_message","pathParams":{"channel_id":"5"},"body":{"content":"hi"},"queryParams":{"limit":3},"reason":"test"}`)
+	code, b = e.do(t, "POST", "/v1/discord/call", `{"tool":"discord_create_message","pathParams":{"channel_id":"`+forumID+`"},"body":{"content":"hi","allowed_mentions":{"parse":["everyone"]}},"queryParams":{"limit":3},"reason":"test"}`)
 	if code != 200 {
 		t.Fatalf("create_message: %d %s", code, b)
 	}
@@ -324,8 +546,101 @@ func TestControlDiscordAllowlist(t *testing.T) {
 	if args["toolName"] != "discord_create_message" || args["authOverride"] != "Bot TOKEN" || args["queryParams"] == nil {
 		t.Fatalf("args: %v", args)
 	}
-	if !strings.Contains(args["auditLogReason"].(string), "admin1") {
+	// 呼ぶ側が何を書いても、だれにも通知しない
+	assertNoMentions(t, args["body"].(map[string]any))
+	// 頼んだ人の名前を先に書く (理由は 200 文字で切れる)
+	if !strings.HasPrefix(args["auditLogReason"].(string), "admin1 (id 42): test") {
 		t.Errorf("reason: %v", args["auditLogReason"])
+	}
+	long := `{"tool":"discord_create_message","pathParams":{"channel_id":"` + forumID + `"},"body":{"content":"x"},"reason":"` + strings.Repeat("r", 500) + `"}`
+	if code, b := e.do(t, "POST", "/v1/discord/call", long); code != 200 {
+		t.Fatalf("long reason: %d %s", code, b)
+	}
+	last := e.mcp.calls[len(e.mcp.calls)-1]["args"].(map[string]any)
+	if r := last["auditLogReason"].(string); !strings.HasPrefix(r, "admin1 (id 42)") || len([]rune(r)) > 200 {
+		t.Errorf("long reason: %q", r)
+	}
+}
+
+// Discord のツールは、通報フォーラムとそのスレッドの中だけ。
+func TestControlDiscordChannelScope(t *testing.T) {
+	e := newCtlEnv(t, ModeReview)
+	call := func(tool, pathParams, body string) int {
+		t.Helper()
+		code, _ := e.do(t, "POST", "/v1/discord/call", `{"tool":"`+tool+`","pathParams":`+pathParams+`,"body":`+body+`}`)
+		return code
+	}
+	in := func(id string) string { return `{"channel_id":"` + id + `"}` }
+	msg := `{"content":"hi"}`
+	tags := `{"applied_tags":["1000000000000000002"]}`
+	thread := `{"name":"x","message":{"content":"hi"}}`
+	for _, c := range []struct {
+		name, tool, params, body string
+		want                     int
+	}{
+		{"フォーラムに書く", "discord_create_message", in(forumID), msg, 200},
+		{"スレッドに書く", "discord_create_message", in(threadID), msg, 200},
+		{"外に書く", "discord_create_message", in(outsideID), msg, 403},
+		{"外を読む", "discord_list_channel_messages", in(outsideID), `null`, 403},
+		{"スレッドを読む", "discord_list_channel_messages", in(threadID), `null`, 200},
+		{"チャンネルの指定が無い", "discord_list_channel_messages", `{}`, `null`, 400},
+		{"ID の形が違う", "discord_get_channel", in("5"), `null`, 400},
+		{"ID に余計な文字", "discord_get_channel", in(forumID + "/../1"), `null`, 400},
+		{"ID が文字列でない", "discord_get_channel", `{"channel_id":5}`, `null`, 400},
+		{"ほかのパスの値の形が違う", "discord_get_message", `{"channel_id":"` + forumID + `","message_id":"x"}`, `null`, 400},
+		{"パスの値の名前の形が違う", "discord_get_channel", `{"channel_id":"` + forumID + `","authOverride":"` + forumID + `"}`, `null`, 400},
+		{"投稿を立てる", "discord_create_thread", in(forumID), thread, 200},
+		{"スレッドの中に投稿は立てない", "discord_create_thread", in(threadID), thread, 403},
+		{"投稿の本文が無い", "discord_create_thread", in(forumID), `{"name":"x"}`, 400},
+		{"メッセージの本文が無い", "discord_create_message", in(forumID), `null`, 400},
+		{"タグを変える", "discord_update_channel", in(threadID), tags, 200},
+		{"名前も変える", "discord_update_channel", in(threadID), `{"name":"x","applied_tags":[]}`, 403},
+		{"権限を変える", "discord_update_channel", in(threadID), `{"permission_overwrites":[]}`, 403},
+		{"タグの形が違う", "discord_update_channel", in(threadID), `{"applied_tags":["x"]}`, 400},
+		{"外のタグを変える", "discord_update_channel", in(outsideID), tags, 403},
+		{"チャンネルを指定しないツール", "discord_get_my_user", `{}`, `null`, 200},
+	} {
+		if code := call(c.tool, c.params, c.body); code != c.want {
+			t.Errorf("%s: %d, want %d", c.name, code, c.want)
+		}
+	}
+}
+
+func TestControlDiscordCallIsAudited(t *testing.T) {
+	e := newCtlEnv(t, ModeReview)
+	const secret = "投稿の本文そのもの"
+	code, b := e.do(t, "POST", "/v1/discord/call", `{"tool":"discord_create_message","pathParams":{"channel_id":"`+forumID+`"},"body":{"content":"`+secret+`"}}`)
+	if code != 200 {
+		t.Fatalf("%d %s", code, b)
+	}
+	code, _ = e.do(t, "POST", "/v1/discord/call", `{"tool":"discord_create_message","pathParams":{"channel_id":"`+outsideID+`"},"body":{"content":"x"}}`)
+	if code != 403 {
+		t.Fatalf("外: %d", code)
+	}
+	raw, err := os.ReadFile(filepath.Join(e.dir, "audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("audit: %s", raw)
+	}
+	var first, second map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &second); err != nil {
+		t.Fatal(err)
+	}
+	if first["tool"] != "discord_create_message" || first["channel"] != forumID || len(first["body_sha256"].(string)) != 64 || first["status"] != float64(200) {
+		t.Fatalf("audit: %v", first)
+	}
+	if strings.Contains(string(raw), secret) {
+		t.Fatalf("本文そのものを残している: %s", raw)
+	}
+	// 断った呼び出しも、どのチャンネルかが残る
+	if second["channel"] != outsideID || second["status"] != float64(403) {
+		t.Fatalf("audit: %v", second)
 	}
 }
 

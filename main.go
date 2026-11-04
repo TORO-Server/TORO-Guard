@@ -1,6 +1,7 @@
 // toro-guard: TORO サーバーの荒らしを見張り、証拠の画像を付けて通報し、ロールバックする。
 //
 //	toro-guard run                    見張りを続ける (GUARD_MODE=observe | dry-run | live)
+//	toro-guard console-relay          コンソールの中継を開く (Docker のソケットを持つ別のコンテナで動かす)
 //	toro-guard check [-console]       設定・データベース・Discord のトークンとチャンネルを確かめる (何も投稿しない)
 //	toro-guard replay -user NAME -from RFC3339 -to RFC3339 [-out DIR] [-no-shot]
 //	                                  過去の記録に閾値を当てはめ、画像と報告文を DIR に作る (投稿・ロールバックはしない)
@@ -23,13 +24,15 @@ var version = "dev"
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: toro-guard run | check | replay | healthcheck")
+		fmt.Fprintln(os.Stderr, "usage: toro-guard run | console-relay | check | replay | healthcheck")
 		os.Exit(2)
 	}
 	var err error
 	switch os.Args[1] {
 	case "run":
 		err = cmdRun(log)
+	case "console-relay":
+		err = cmdConsoleRelay(log)
 	case "check":
 		err = cmdCheck(log, os.Args[2:])
 	case "replay":
@@ -39,7 +42,7 @@ func main() {
 	case "scan-chat":
 		err = cmdScanChat(os.Args[2:])
 	case "healthcheck":
-		err = cmdHealth()
+		err = cmdHealth(os.Args[2:])
 	case "version":
 		fmt.Println(version)
 	default:
@@ -67,6 +70,9 @@ func cmdRun(log *slog.Logger) error {
 	if err := cp.Ping(ctx); err != nil {
 		return fmt.Errorf("database: %w", err)
 	}
+	if cfg.DBUser == "root" {
+		log.Warn("データベースに root でつないでいます。SELECT だけの専用のユーザーにしてください (DB_USER、DB_PASSWORD_FILE)")
+	}
 	st, err := OpenStore(cfg.DataDir)
 	if err != nil {
 		return err
@@ -76,7 +82,7 @@ func cmdRun(log *slog.Logger) error {
 	var sh *Shooter
 	var rep *Reporter
 	if cfg.Mode != ModeObserve {
-		ops = &Ops{C: &DockerConsole{Socket: cfg.DockerSocket, Container: cfg.MCContainer}}
+		ops = &Ops{C: NewRelayConsole(cfg.ConsoleURL)}
 		sh = NewShooter(cfg)
 	}
 	if cfg.Mode == ModeLive || cfg.Mode == ModeReview {
@@ -109,7 +115,6 @@ func cmdRun(log *slog.Logger) error {
 		"sustained", fmt.Sprintf("壊 %d / %s", cfg.SustainedBreaks, cfg.SustainedWindow),
 		"trusted", len(cfg.TrustedPlayers), "warps", len(g.warps))
 	touchHealth(cfg)
-	go keepHealth(ctx, cfg)
 	return g.Run(ctx)
 }
 
@@ -159,7 +164,7 @@ func cmdCheck(log *slog.Logger, args []string) error {
 	}
 
 	if *console {
-		ops := Ops{C: &DockerConsole{Socket: cfg.DockerSocket, Container: cfg.MCContainer}}
+		ops := Ops{C: NewRelayConsole(cfg.ConsoleURL)}
 		for _, mapID := range cfg.MapIDs {
 			idle, err := ops.BlueMapIdle(ctx, mapID)
 			if err != nil {
@@ -253,17 +258,27 @@ func cmdReplay(log *slog.Logger, args []string) error {
 	return nil
 }
 
-// healthcheck: 見張りが回っていれば、DataDir/health の更新時刻が新しい。
-func cmdHealth() error {
+// healthcheck: 見張りの 1 回が成功していれば、DataDir/health の更新時刻が新しい。-relay は、コンソールの中継を確かめる。
+func cmdHealth(args []string) error {
+	fs := flag.NewFlagSet("healthcheck", flag.ExitOnError)
+	relay := fs.Bool("relay", false, "コンソールの中継 (console-relay) が答えるかを確かめる")
+	_ = fs.Parse(args)
+	if *relay {
+		return relayHealth()
+	}
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
-	fi, err := os.Stat(filepath.Join(cfg.DataDir, "health"))
+	return checkHealthFile(cfg.DataDir, time.Now())
+}
+
+func checkHealthFile(dataDir string, now time.Time) error {
+	fi, err := os.Stat(filepath.Join(dataDir, "health"))
 	if err != nil {
 		return err
 	}
-	if time.Since(fi.ModTime()) > 2*time.Minute {
+	if now.Sub(fi.ModTime()) > 2*time.Minute {
 		return fmt.Errorf("health file is stale: %s", fi.ModTime())
 	}
 	return nil
@@ -272,17 +287,4 @@ func cmdHealth() error {
 func touchHealth(cfg *Config) {
 	_ = os.MkdirAll(cfg.DataDir, 0o755)
 	_ = os.WriteFile(filepath.Join(cfg.DataDir, "health"), []byte(time.Now().Format(time.RFC3339)), 0o644)
-}
-
-func keepHealth(ctx context.Context, cfg *Config) {
-	t := time.NewTicker(30 * time.Second)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			touchHealth(cfg)
-		}
-	}
 }

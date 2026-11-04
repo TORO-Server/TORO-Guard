@@ -71,6 +71,7 @@ type Config struct {
 	AIChat     bool // チャットの発言を AI にも見せる
 
 	// Discord
+	BotToken         string // DISCORD_BOT_TOKEN (または _FILE)。空なら DiscordSRVConfig から読む
 	DiscordSRVConfig string
 	ReportChannelID  string
 	RollbackTagID    string
@@ -78,14 +79,14 @@ type Config struct {
 	DiscordMCPLazy   bool   // サーバーが DISCORD_MCP_LAZY_TOOLS=true (discord_call_tool 1 本) か
 	MCPProtocol      string // Mcp-Protocol-Version
 
-	// Minecraft のコンソール (docker attach)
-	DockerSocket string
-	MCContainer  string
-	KickEnabled  bool
+	// Minecraft のコンソール (中継の toro-guard console-relay に頼む。Docker のソケットは持たない)
+	ConsoleURL  string
+	KickEnabled bool
 
 	// BlueMap の画面
 	BlueMapURL     string // 例: http://3d-map.torosaba.net
-	BlueMapResolve string // 例: toro-edge:80 (Host の名前をこの先に向ける)。空ならそのまま
+	BrowserURL     string // 別のコンテナのブラウザ (例: ws://toro-chrome:9222)。空なら、手元の Chromium を起動する (開発用)
+	BlueMapResolve string // 手元の Chromium だけ。例: toro-edge:80 (Host の名前をこの先に向ける)。空ならそのまま
 	MapIDs         map[string]string
 	ChromePath     string
 	ShotWidth      int
@@ -101,17 +102,30 @@ type Config struct {
 	RequireLiveRoles bool     // true なら、auth がいまの Discord で確かめたロール (roles_source=live) だけを信じる
 	DiscordAllow     string   // 窓口から呼んでよい Discord のツール名の正規表現
 
-	WarpsDir string
-	DataDir  string
+	WarpsDir        string
+	DataDir         string
+	ReportRetention time.Duration // 事件のフォルダを残す長さ。0 なら消さない
 }
 
 func loadConfig() (*Config, error) {
+	dbPassword, err := envSecret("DB_PASSWORD")
+	if err != nil {
+		return nil, err
+	}
+	aiKey, err := firstSecret("AI_API_KEY", "ANTHROPIC_API_KEY")
+	if err != nil {
+		return nil, err
+	}
+	botToken, err := envSecret("DISCORD_BOT_TOKEN")
+	if err != nil {
+		return nil, err
+	}
 	c := &Config{
 		Mode:             Mode(envStr("GUARD_MODE", "observe")),
 		DBHost:           envStr("DB_HOST", "tidb"),
 		DBPort:           envStr("DB_PORT", "4000"),
 		DBUser:           envStr("DB_USER", "root"),
-		DBPassword:       os.Getenv("DB_PASSWORD"),
+		DBPassword:       dbPassword,
 		DBName:           envStr("DB_NAME", "coreprotect"),
 		TablePrefix:      envStr("DB_TABLE_PREFIX", "coreprotect_"),
 		BurstWindow:      envDur("BURST_WINDOW", 5*time.Second),
@@ -126,7 +140,7 @@ func loadConfig() (*Config, error) {
 		OpsFile:          os.Getenv("OPS_FILE"),
 		PollInterval:     envDur("POLL_INTERVAL", 3*time.Second),
 		MaxEventAge:      envDur("MAX_EVENT_AGE", 15*time.Minute),
-		AIKey:            firstEnv("AI_API_KEY", "ANTHROPIC_API_KEY"),
+		AIKey:            aiKey,
 		AIBaseURL:        envStr("AI_BASE_URL", "https://api.anthropic.com"),
 		AIModel:          envStr("AI_MODEL", "claude-haiku-5-5"),
 		AIMinConf:        envInt("AI_MIN_CONFIDENCE", 70),
@@ -143,16 +157,17 @@ func loadConfig() (*Config, error) {
 		ChatQuiet:        envDur("CHAT_QUIET", 30*time.Second),
 		ChatMuteCmd:      os.Getenv("CHAT_MUTE_CMD"),
 		ChatMuteTagID:    os.Getenv("CHAT_MUTE_TAG_ID"),
+		BotToken:         botToken,
 		DiscordSRVConfig: envStr("DISCORDSRV_CONFIG", "/discordsrv/config.yml"),
 		ReportChannelID:  envStr("REPORT_CHANNEL_ID", "1000000000000000001"),
 		RollbackTagID:    envStr("ROLLBACK_TAG_ID", "1000000000000000002"),
 		DiscordMCPURL:    envStr("DISCORD_MCP_URL", "http://discord-mcp:8085/mcp"),
 		DiscordMCPLazy:   envBool("DISCORD_MCP_LAZY", true),
 		MCPProtocol:      envStr("MCP_PROTOCOL_VERSION", "2025-11-25"),
-		DockerSocket:     envStr("DOCKER_SOCKET", "/var/run/docker.sock"),
-		MCContainer:      envStr("MC_CONTAINER", "toro-main"),
+		ConsoleURL:       envStr("CONSOLE_URL", "http://toro-console:8091"),
 		KickEnabled:      envBool("KICK_ENABLED", false),
 		BlueMapURL:       envStr("BLUEMAP_URL", "http://3d-map.torosaba.net"),
+		BrowserURL:       strings.TrimSpace(os.Getenv("BROWSER_URL")),
 		BlueMapResolve:   os.Getenv("BLUEMAP_RESOLVE"),
 		MapIDs:           parseMap(envStr("MAP_IDS", "main=overworld")),
 		ChromePath:       os.Getenv("CHROME_PATH"),
@@ -166,6 +181,7 @@ func loadConfig() (*Config, error) {
 		DiscordAllow:     envStr("CONTROL_DISCORD_ALLOW", defaultDiscordAllow),
 		WarpsDir:         os.Getenv("WARPS_DIR"),
 		DataDir:          envStr("DATA_DIR", "/data"),
+		ReportRetention:  envDur("REPORT_RETENTION", 90*24*time.Hour),
 	}
 	switch c.Mode {
 	case ModeObserve, ModeDryRun, ModeReview, ModeLive:
@@ -175,13 +191,30 @@ func loadConfig() (*Config, error) {
 	return c, nil
 }
 
-func firstEnv(keys ...string) string {
+// envSecret は秘密の値を読む。K_FILE があれば、そのファイルの中身 (Docker の secret など)。無ければ環境変数の K。
+func envSecret(k string) (string, error) {
+	if p := strings.TrimSpace(os.Getenv(k + "_FILE")); p != "" {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return "", fmt.Errorf("%s_FILE: %w", k, err)
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
+	return strings.TrimSpace(os.Getenv(k)), nil
+}
+
+// firstSecret は、keys の順に envSecret を読んで、空でない最初の値を返す。
+func firstSecret(keys ...string) (string, error) {
 	for _, k := range keys {
-		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
-			return v
+		v, err := envSecret(k)
+		if err != nil {
+			return "", err
+		}
+		if v != "" {
+			return v, nil
 		}
 	}
-	return ""
+	return "", nil
 }
 
 func envStr(k, d string) string {

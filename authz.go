@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 )
@@ -17,6 +19,7 @@ import (
 // auth は、claims.roles を、トークンの値ではなく「いまの Discord のロール」にして返す (roles_source=live)。
 // OAuth のアクセストークンにはロールが入っていないし、90 日トークンのロールは古くなるので、判断はここで行う。
 //   - トークンが無効・期限切れ → 401 (クライアントが、再認可できるように WWW-Authenticate を付ける)
+//   - scope があるのに mcp が入っていない → 403 (読み取りだけに同意したトークンでは、管理の操作をさせない)
 //   - ロールが ADMIN_ROLE_IDS のどれでもない → 403
 //   - auth に尋ねられない、またはロールを確かめられていない → 503 (権限を、安全な側に倒す)
 
@@ -87,13 +90,17 @@ func (a *Authz) Check(ctx context.Context, token string) (*Principal, authResult
 			Username    string   `json:"username"`
 			Roles       []string `json:"roles"`
 			RolesSource string   `json:"roles_source"`
+			Scope       *string  `json:"scope"`
 		} `json:"claims"`
 	}
-	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(res.Body, maxBody)).Decode(&out); err != nil {
 		return nil, authUnavailable, "auth の返事を読めません"
 	}
 	if !out.Active || out.Claims.ID == "" {
 		return nil, authInvalid, "トークンが無効か、期限切れです"
+	}
+	if !scopeAllows(out.Claims.Scope) {
+		return nil, authForbidden, "トークンの scope に mcp がありません"
 	}
 	if a.requireLive && out.Claims.RolesSource != "live" {
 		// auth が Discord でロールを確かめていない (古いトークンの値や、障害)。Admin かを判断できない
@@ -105,6 +112,15 @@ func (a *Authz) Check(ctx context.Context, token string) (*Principal, authResult
 		}
 	}
 	return nil, authForbidden, "Admin 以上のロールが要ります"
+}
+
+// scopeAllows は、トークンの scope が窓口の操作を許しているか。
+// scope の無いトークンは、本人が auth で発行した 90 日トークン。ある場合は、OAuth の同意の範囲 (空白区切り) に mcp が要る。
+func scopeAllows(scope *string) bool {
+	if scope == nil {
+		return true
+	}
+	return slices.Contains(strings.Fields(*scope), "mcp")
 }
 
 // Middleware は、すべての経路に認証を掛け、認証できた人を、リクエストに付ける。本文の大きさにも上限を掛ける。

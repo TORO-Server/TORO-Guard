@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -38,14 +39,22 @@ func (c *CP) MaxChatRowID(ctx context.Context) (int64, error) {
 	return n.Int64, err
 }
 
-// ChatFor は 1 人の発言を、時間の順に返す。
+// maxChatFor は、ChatFor が返す発言の数の上限 (新しいほうを残す)。
+const maxChatFor = 5000
+
+// ChatFor は 1 人の発言を、時間の順に返す。多いときは、新しいほうから maxChatFor 件まで。
 func (c *CP) ChatFor(ctx context.Context, user int, from, to int64) ([]ChatMsg, error) {
-	rows, err := c.db.QueryContext(ctx, "SELECT rowid, time, user, message FROM "+c.p+"chat WHERE user = ? AND time BETWEEN ? AND ? ORDER BY time, rowid", user, from, to)
+	rows, err := c.db.QueryContext(ctx, "SELECT rowid, time, user, message FROM "+c.p+"chat WHERE user = ? AND time BETWEEN ? AND ? ORDER BY time DESC, rowid DESC LIMIT ?", user, from, to, maxChatFor)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	return scanChat(rows)
+	msgs, err := scanChat(rows)
+	if err != nil {
+		return nil, err
+	}
+	slices.Reverse(msgs)
+	return msgs, nil
 }
 
 // ChatSince は since 以降の発言を、新しいほうから最大 limit 件取って、時間の順に返す。user が 0 でなければ、その人だけ。
@@ -254,7 +263,7 @@ func BuildChatReport(in ChatReportInput) string {
 		b.WriteString("**【試運転】投稿もミュートもしていません (内容の確認用)**\n")
 	}
 	b.WriteString("**種類**: チャットのスパム\n")
-	b.WriteString(fmt.Sprintf("**荒らしプレイヤー**: %s (`%s`)\n", in.Name, in.UUID))
+	b.WriteString(fmt.Sprintf("**荒らしプレイヤー**: %s (`%s`)\n", safeChat(in.Name, 40), safeChat(in.UUID, 40)))
 	if n := len(in.Msgs); n > 0 {
 		t0, t1 := in.Msgs[0].Time, in.Msgs[n-1].Time
 		b.WriteString(fmt.Sprintf("**時間**: %s 〜 %s (約 %d 秒)\n", time.Unix(t0, 0).In(jst).Format("01/02 15:04:05"), time.Unix(t1, 0).In(jst).Format("15:04:05"), t1-t0))
@@ -265,7 +274,7 @@ func BuildChatReport(in ChatReportInput) string {
 	case in.Muted:
 		b.WriteString("**対応**: ミュートした `" + in.MuteCmd + "`\n")
 	case in.MuteErr != "":
-		b.WriteString("**対応**: ミュートに失敗 (" + oneLine(in.MuteErr, 120) + ")\n")
+		b.WriteString("**対応**: ミュートに失敗 (" + safeChat(in.MuteErr, 120) + ")\n")
 	case in.MuteCmd != "":
 		b.WriteString("**対応 (予定)**: `" + in.MuteCmd + "`\n")
 	}
@@ -289,14 +298,16 @@ func pickChatLines(m []ChatMsg, n int) []ChatMsg {
 	return append(append([]ChatMsg(nil), m[:h]...), m[len(m)-(n-h):]...)
 }
 
-// safeChat は、1 行にして、長さを切り、メンションを無効にする。
+// safeChat は、Discord に載せるプレイヤーの文字を無害にする。制御文字を除いて 1 行にし、長さを切り、
+// メンション・インラインコードの区切り・マスクリンクを無効にする。
 func safeChat(s string, max int) string {
-	s = strings.Join(strings.Fields(s), " ")
+	s = strings.Join(strings.Fields(ctlRE.ReplaceAllString(s, " ")), " ")
 	if r := []rune(s); len(r) > max {
 		s = string(r[:max]) + "…"
 	}
 	s = strings.ReplaceAll(s, "@", "@​")
 	s = strings.ReplaceAll(s, "`", "'")
+	s = strings.ReplaceAll(s, "](", "] (")
 	return s
 }
 
@@ -305,12 +316,24 @@ func MuteCommand(tmpl, name string) string {
 	if strings.TrimSpace(tmpl) == "" || !validName(name) {
 		return ""
 	}
-	return strings.ReplaceAll(tmpl, "{name}", name)
+	return strings.ReplaceAll(strings.TrimSpace(tmpl), "{name}", name)
 }
 
-var nameRE = regexp.MustCompile(`^[A-Za-z0-9_.]{1,32}$`)
+// コンソールに渡す値の形。中継の許可 (relay.go) も、同じ形を使う。
+const (
+	namePattern = `[A-Za-z0-9_.]{1,32}`
+	idPattern   = `[A-Za-z0-9_-]{1,64}` // ワールドと地図の名前
+)
+
+var (
+	nameRE  = regexp.MustCompile(`^` + namePattern + `$`)
+	worldRE = regexp.MustCompile(`^` + idPattern + `$`)
+)
 
 func validName(n string) bool { return nameRE.MatchString(n) }
+
+// validWorld は、ワールドと地図の名前として安全か。
+func validWorld(w string) bool { return worldRE.MatchString(w) }
 
 // ---- scan-chat: 過去の発言に、いまの決まりを当てはめて、誤検知を見積もる (何も書かない・投稿しない) ----
 
@@ -395,8 +418,11 @@ type ChatResult struct {
 //
 //	observe: まとめを記録するだけ
 //	dry-run: 報告文をフォルダに置くだけ (投稿もミュートもしない)
-//	live:    (設定があれば) ミュート → 通報
+//	live:    (設定があれば) ミュート → 通報。AI の判定だけの事件は、ミュートしない
 func (g *Guard) ProcessChat(ctx context.Context, inc *Incident, end int64) (*ChatResult, error) {
+	if !validID(inc.ID) {
+		return nil, fmt.Errorf("事件の ID %q はフォルダに使えません", inc.ID)
+	}
 	msgs, err := g.cp.ChatFor(ctx, inc.UserID, inc.Start-60, end)
 	if err != nil {
 		return nil, fmt.Errorf("chat: %w", err)
@@ -414,9 +440,11 @@ func (g *Guard) ProcessChat(ctx context.Context, inc *Incident, end int64) (*Cha
 	}
 
 	in := ChatReportInput{Name: inc.Name, UUID: inc.UUID, Msgs: msgs, Trigger: inc.Trigger, Mode: g.cfg.Mode}
-	in.MuteCmd = MuteCommand(g.cfg.ChatMuteCmd, inc.Name)
+	if !inc.AIOnly {
+		in.MuteCmd = MuteCommand(g.cfg.ChatMuteCmd, inc.Name)
+	}
 	if g.cfg.Mode == ModeLive && in.MuteCmd != "" && g.ops != nil {
-		if _, err := g.ops.C.Run(ctx, in.MuteCmd, 5*time.Second, nil); err != nil {
+		if _, err := g.ops.C.Run(ctx, in.MuteCmd, sendOnlyTimeout, nil); err != nil {
 			in.MuteErr = err.Error()
 			g.log.Error("ミュートに失敗", "player", inc.Name, "err", err)
 		} else {
@@ -442,7 +470,7 @@ func (g *Guard) ProcessChat(ctx context.Context, inc *Incident, end int64) (*Cha
 		if res.Muted && g.cfg.ChatMuteTagID != "" {
 			tags = append(tags, g.cfg.ChatMuteTagID)
 		}
-		id, err := g.reporter.PostTags(ctx, existing, inc.Name, res.Report, nil, tags)
+		id, err := g.reporter.PostTags(ctx, existing, safeChat(inc.Name, 90), res.Report, nil, tags)
 		if err != nil {
 			return res, fmt.Errorf("post: %w", err)
 		}

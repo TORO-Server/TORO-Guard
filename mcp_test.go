@@ -79,6 +79,7 @@ func TestReporterPostsThroughMCP(t *testing.T) {
 	if body["name"] != "fuuty119" || body["applied_tags"].([]any)[0] != "55" || body["message"].(map[string]any)["content"] != "本文" {
 		t.Fatalf("body: %v", body)
 	}
+	assertNoMentions(t, body["message"].(map[string]any))
 	file := args["files"].([]any)[0].(map[string]any)
 	if b, _ := base64.StdEncoding.DecodeString(file["contentBase64"].(string)); string(b) != "PNGDATA" || file["filename"] != "a.png" {
 		t.Fatalf("file: %v", file)
@@ -99,6 +100,19 @@ func TestReporterAppendsToExistingThread(t *testing.T) {
 	}
 	if f.calls[0]["args"].(map[string]any)["toolName"] != "discord_create_message" || f.calls[1]["args"].(map[string]any)["toolName"] != "discord_update_channel" {
 		t.Fatalf("calls: %v", f.calls)
+	}
+	assertNoMentions(t, f.calls[0]["args"].(map[string]any)["body"].(map[string]any))
+}
+
+// assertNoMentions は、投稿の本文が、だれにも通知しない設定かを確かめる。
+func assertNoMentions(t *testing.T, m map[string]any) {
+	t.Helper()
+	am, ok := m["allowed_mentions"].(map[string]any)
+	if !ok {
+		t.Fatalf("allowed_mentions が無い: %v", m)
+	}
+	if parse, ok := am["parse"].([]any); !ok || len(parse) != 0 {
+		t.Fatalf("allowed_mentions: %v", am)
 	}
 }
 
@@ -151,6 +165,16 @@ func TestMCPDirectToolsWhenNotLazy(t *testing.T) {
 	}
 	if gotName != "discord_get_channel" || gotArgs["channel_id"] != "1" {
 		t.Fatalf("name=%q args=%v", gotName, gotArgs)
+	}
+	// パスの値で、予約の引数 (トークンや添付) を上書きできない
+	for _, reserved := range []string{"authOverride", "files", "body", "toolName"} {
+		gotName = ""
+		_, err := NewMCP(srv.URL, "2025-11-25", false).Discord(context.Background(), DiscordCall{
+			Tool: "discord_get_channel", Auth: "Bot real", PathParams: map[string]any{reserved: "other"},
+		})
+		if err == nil || gotName != "" {
+			t.Errorf("%s: err=%v name=%q", reserved, err, gotName)
+		}
 	}
 }
 

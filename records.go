@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 // 事件の状態。窓口 (control) は、pending のものを「確認待ち」として見せる。
@@ -147,6 +149,9 @@ func (g *Guard) Records(state string, limit int) ([]*Record, error) {
 
 // update は、事件の記録を読み直して f で書き換えて保存する (同じ事件への操作が重ならないように g.recMu を持つ)。
 func (g *Guard) update(id string, f func(*Record)) (*Record, error) {
+	if !validID(id) {
+		return nil, ErrNoRecord
+	}
 	g.recMu.Lock()
 	defer g.recMu.Unlock()
 	r, err := loadRecord(g.reportDir(id))
@@ -162,4 +167,67 @@ func (g *Guard) update(id string, f func(*Record)) (*Record, error) {
 
 func (r *Record) decide(at int64, by, action, note string) {
 	r.History = append(r.History, Decision{At: at, By: by, Action: action, Note: note})
+}
+
+// shotRetention は、窓口の撮影の結果を残す時間 (job は 1 時間で捨てる。再起動で job を忘れた分も、ここで消える)。
+const shotRetention = 2 * time.Hour
+
+// sweepLoop は、起動したときと 1 時間ごとに、古いデータを消す。
+func (g *Guard) sweepLoop(ctx context.Context) {
+	t := time.NewTicker(time.Hour)
+	defer t.Stop()
+	for {
+		g.sweepData(time.Now())
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// sweepData は、保持期限を過ぎた事件のフォルダと、撮影の結果を消す (ディスクを使い切らないように)。
+// 消すのは reports/ と shots/ の中だけ。いま動いている事件は消さない。REPORT_RETENTION が 0 なら、事件は消さない。
+func (g *Guard) sweepData(now time.Time) {
+	if keep := g.cfg.ReportRetention; keep > 0 {
+		root := filepath.Join(g.cfg.DataDir, "reports")
+		entries, _ := os.ReadDir(root)
+		for _, e := range entries {
+			if !e.IsDir() || !validID(e.Name()) || g.isBusy(e.Name()) {
+				continue
+			}
+			if at, ok := incidentTime(g.reportDir(e.Name())); ok && now.Sub(at) > keep {
+				if err := os.RemoveAll(filepath.Join(root, e.Name())); err != nil {
+					g.log.Warn("古い事件を消せない", "incident", e.Name(), "err", err)
+					continue
+				}
+				g.log.Info("保持期限を過ぎた事件を消した", "incident", e.Name())
+			}
+		}
+	}
+	dir := filepath.Join(g.cfg.DataDir, "shots")
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if info, err := e.Info(); err == nil && info.Mode().IsRegular() && now.Sub(info.ModTime()) > shotRetention {
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
+}
+
+func (g *Guard) isBusy(id string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.busy[id] != ""
+}
+
+// incidentTime は、事件ができた時刻。記録が無いフォルダ (observe のときのものなど) は、フォルダの更新時刻。
+func incidentTime(dir string) (time.Time, bool) {
+	if r, err := loadRecord(dir); err == nil && r.Created > 0 {
+		return time.Unix(r.Created, 0), true
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return info.ModTime(), true
 }
