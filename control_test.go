@@ -15,21 +15,57 @@ import (
 	"time"
 )
 
-const testControlToken = "control-token-for-tests-0123456789"
+// 利用者のトークン (OAuth 2.0 の Bearer)。偽の auth が、これを claims に引き換える。
+const (
+	tokAdmin   = "tok-admin"   // Admin ロール (いまの Discord で確かめた)
+	tokMod     = "tok-mod"     // Admin ではないロール
+	tokStale   = "tok-stale"   // Admin ロールだが、auth が Discord で確かめていない (トークンの値のまま)
+	tokExpired = "tok-expired" // 無効
+)
+
+const adminRole = "100000000000000002"
+
+// fakeAuth は auth の /introspect の代わり。
+type fakeAuth struct {
+	down  bool
+	calls int
+}
+
+func (f *fakeAuth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.calls++
+	if f.down || r.URL.Path != "/introspect" {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	var in struct{ Token string }
+	_ = json.NewDecoder(r.Body).Decode(&in)
+	claims := map[string]map[string]any{
+		tokAdmin: {"id": "42", "username": "admin1", "roles": []string{"1", adminRole}, "roles_source": "live"},
+		tokMod:   {"id": "43", "username": "mod1", "roles": []string{"100000000000000003"}, "roles_source": "live"},
+		tokStale: {"id": "44", "username": "stale1", "roles": []string{adminRole}, "roles_source": "token"},
+	}[in.Token]
+	w.Header().Set("Content-Type", "application/json")
+	if claims == nil {
+		_ = json.NewEncoder(w).Encode(map[string]any{"active": false})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"active": true, "claims": claims})
+}
 
 type ctlEnv struct {
-	g   *Guard
-	srv *httptest.Server
-	con *fakeConsole
-	mcp *fakeMCP
-	dir string
+	auth *fakeAuth
+	g    *Guard
+	srv  *httptest.Server
+	con  *fakeConsole
+	mcp  *fakeMCP
+	dir  string
 }
 
 func newCtlEnv(t *testing.T, mode Mode) *ctlEnv {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := &Config{
-		Mode: mode, DataDir: dir, ControlToken: testControlToken, DiscordAllow: defaultDiscordAllow,
+		Mode: mode, DataDir: dir, DiscordAllow: defaultDiscordAllow, AdminRoles: []string{"100000000000000001", adminRole}, RequireLiveRoles: true,
 		ChatMuteCmd: "mute {name} 10m spam", TrustedPlayers: map[string]bool{"trusty": true},
 		MapIDs: map[string]string{"main": "overworld"},
 	}
@@ -48,20 +84,23 @@ func newCtlEnv(t *testing.T, mode Mode) *ctlEnv {
 	mcpSrv := httptest.NewServer(fm)
 	t.Cleanup(mcpSrv.Close)
 	g.reporter = NewReporter(NewMCP(mcpSrv.URL, "2025-11-25", true), "TOKEN", "100", "55")
+	fa := &fakeAuth{}
+	authSrv := httptest.NewServer(fa)
+	t.Cleanup(authSrv.Close)
+	cfg.AuthInternalURL = authSrv.URL
 	ctl, err := NewControl(context.Background(), g)
 	if err != nil {
 		t.Fatal(err)
 	}
 	srv := httptest.NewServer(ctl.Handler())
 	t.Cleanup(srv.Close)
-	return &ctlEnv{g: g, srv: srv, con: con, mcp: fm, dir: dir}
+	return &ctlEnv{auth: fa, g: g, srv: srv, con: con, mcp: fm, dir: dir}
 }
 
 func (e *ctlEnv) do(t *testing.T, method, path, body string) (int, []byte) {
 	t.Helper()
 	req, _ := http.NewRequest(method, e.srv.URL+path, strings.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+testControlToken)
-	req.Header.Set("X-Toro-User", "admin1 (id 42)")
+	req.Header.Set("Authorization", "Bearer "+tokAdmin)
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -86,9 +125,9 @@ func (e *ctlEnv) putRecord(t *testing.T, r *Record) {
 	}
 }
 
-func TestControlRequiresToken(t *testing.T) {
+func TestControlAuthenticatesWithOAuthTokens(t *testing.T) {
 	e := newCtlEnv(t, ModeReview)
-	for _, auth := range []string{"", "Bearer wrong", testControlToken, "Bearer " + testControlToken + "x"} {
+	get := func(auth string) (int, string, string) {
 		req, _ := http.NewRequest("GET", e.srv.URL+"/v1/status", nil)
 		if auth != "" {
 			req.Header.Set("Authorization", auth)
@@ -98,22 +137,52 @@ func TestControlRequiresToken(t *testing.T) {
 			t.Fatal(err)
 		}
 		res.Body.Close()
-		if res.StatusCode != 401 {
-			t.Errorf("auth %q: status %d, want 401", auth, res.StatusCode)
+		return res.StatusCode, res.Header.Get("WWW-Authenticate"), res.Header.Get("Retry-After")
+	}
+	// トークンが無い・無効 → 401 (再認可を促す)
+	for _, auth := range []string{"", "Basic abc", "Bearer ", "Bearer " + tokExpired, "Bearer nonsense", tokAdmin} {
+		code, challenge, _ := get(auth)
+		if code != 401 || !strings.Contains(challenge, "invalid_token") {
+			t.Errorf("auth %q: %d %q, want 401 + challenge", auth, code, challenge)
 		}
 	}
-	if code, _ := e.do(t, "GET", "/v1/status", ""); code != 200 {
-		t.Fatalf("status %d", code)
+	// Admin ではない人 → 403
+	if code, _, _ := get("Bearer " + tokMod); code != 403 {
+		t.Errorf("non-admin: %d, want 403", code)
+	}
+	// auth が Discord で確かめていないロールは、信じない (古いトークンの値) → 503
+	if code, _, retry := get("Bearer " + tokStale); code != 503 || retry == "" {
+		t.Errorf("stale roles: %d retry=%q, want 503", code, retry)
+	}
+	// Admin → 200
+	if code, _, _ := get("Bearer " + tokAdmin); code != 200 {
+		t.Errorf("admin: %d, want 200", code)
+	}
+	// auth が落ちている → 503 (401 にして、再認可させない)
+	e.auth.down = true
+	if code, _, _ := get("Bearer " + tokAdmin); code != 503 {
+		t.Errorf("auth down: %d, want 503", code)
 	}
 }
 
-func TestControlConfigRejectsShortToken(t *testing.T) {
-	t.Setenv("CONTROL_TOKEN", "short")
-	if _, err := loadConfig(); err == nil {
-		t.Fatal("want error for a short CONTROL_TOKEN")
+func TestControlStaleRolesAllowedWhenNotRequired(t *testing.T) {
+	e := newCtlEnv(t, ModeReview)
+	e.g.cfg.RequireLiveRoles = false
+	e.srv.Close()
+	ctl, _ := NewControl(context.Background(), e.g)
+	srv := httptest.NewServer(ctl.Handler())
+	defer srv.Close()
+	req, _ := http.NewRequest("GET", srv.URL+"/v1/status", nil)
+	req.Header.Set("Authorization", "Bearer "+tokStale)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("status %d, want 200 when CONTROL_REQUIRE_LIVE_ROLES=false", res.StatusCode)
 	}
 }
-
 func TestControlIncidentsListGetImage(t *testing.T) {
 	e := newCtlEnv(t, ModeReview)
 	now := time.Now().Unix()

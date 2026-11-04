@@ -92,11 +92,14 @@ type Config struct {
 	ShotHeight     int
 	ShotSettle     time.Duration
 
-	// 操作の窓口 (TORO-MCP が、Admin 以上の人の頼みを取り次ぐ)。内部のネットワークだけに出す。
-	// ControlToken が空なら窓口は開かない
-	ControlAddr  string
-	ControlToken string
-	DiscordAllow string // 窓口から呼んでよい Discord のツール名の正規表現
+	// 操作の窓口 (TORO-MCP が、Admin 以上の人の頼みを、その人のトークンのまま取り次ぐ)。内部のネットワークだけに出す。
+	// 認証は OAuth 2.0 のトークン: auth の確認の窓口 (/introspect) に尋ね、いまの Discord のロールが AdminRoles のどれかであること。
+	// ControlAddr が空なら窓口は開かない
+	ControlAddr      string
+	AuthInternalURL  string   // auth の確認の窓口 (内部のネットワークだけ)
+	AdminRoles       []string // 窓口を使える Discord のロールの ID (Owner と Admin)
+	RequireLiveRoles bool     // true なら、auth がいまの Discord で確かめたロール (roles_source=live) だけを信じる
+	DiscordAllow     string   // 窓口から呼んでよい Discord のツール名の正規表現
 
 	WarpsDir string
 	DataDir  string
@@ -157,7 +160,9 @@ func loadConfig() (*Config, error) {
 		ShotHeight:       envInt("SHOT_HEIGHT", 720),
 		ShotSettle:       envDur("SHOT_SETTLE", 60*time.Second),
 		ControlAddr:      envStr("CONTROL_ADDR", ":8090"),
-		ControlToken:     strings.TrimSpace(os.Getenv("CONTROL_TOKEN")),
+		AuthInternalURL:  strings.TrimRight(envStr("AUTH_INTERNAL_URL", "http://toro-auth:8081"), "/"),
+		AdminRoles:       splitList(envStr("ADMIN_ROLE_IDS", defaultAdminRoles)),
+		RequireLiveRoles: envBool("CONTROL_REQUIRE_LIVE_ROLES", true),
 		DiscordAllow:     envStr("CONTROL_DISCORD_ALLOW", defaultDiscordAllow),
 		WarpsDir:         os.Getenv("WARPS_DIR"),
 		DataDir:          envStr("DATA_DIR", "/data"),
@@ -166,9 +171,6 @@ func loadConfig() (*Config, error) {
 	case ModeObserve, ModeDryRun, ModeReview, ModeLive:
 	default:
 		return nil, fmt.Errorf("GUARD_MODE must be observe, dry-run, review or live: %q", c.Mode)
-	}
-	if c.ControlToken != "" && len(c.ControlToken) < 24 {
-		return nil, fmt.Errorf("CONTROL_TOKEN must be at least 24 characters")
 	}
 	return c, nil
 }
@@ -236,4 +238,17 @@ func parseMap(s string) map[string]string {
 		}
 	}
 	return m
+}
+
+// defaultAdminRoles は、窓口を使える Discord のロール (TORO サーバーの Owner と Admin)。
+const defaultAdminRoles = "100000000000000001,100000000000000002"
+
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

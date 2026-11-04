@@ -56,9 +56,10 @@
       - TZ=Asia/Tokyo
       # observe → dry-run → review (人や Muse が見て決める) → live (自動でロールバックまで) の順に上げる
       - GUARD_MODE=observe
-      # 操作の窓口 (:8090、内部のネットワークだけ。ports は付けない)。TORO-MCP が、Admin 以上の人の頼みを取り次ぐ。
-      # 24 文字以上のランダムな値を .env に置き (リポジトリには置かない)、toro-mcp にも同じ値を渡す。空なら窓口は開かない
-      - CONTROL_TOKEN=${TORO_GUARD_CONTROL_TOKEN:-}
+      # 操作の窓口 (:8090、内部のネットワークだけ。ports は付けない)。TORO-MCP が、利用者の OAuth のトークンをそのまま渡す。
+      # 窓口が auth の /introspect に尋ね、いまの Discord のロールが Admin 以上 (ADMIN_ROLE_IDS) の人だけを通す。共有の秘密は無い
+      - AUTH_INTERNAL_URL=http://toro-auth:8081
+      - ADMIN_ROLE_IDS=100000000000000001,100000000000000002
       - DB_HOST=tidb
       - DB_PASSWORD=${NUXT_DB_PASSWORD:-}
       # 通報先は、荒らし通報フォーラム。トークンは DiscordSRV の config.yml (BotToken) を読み、Discord-MCP に渡す
@@ -90,7 +91,7 @@
       - minecraft-network
 
   # TORO-MCP (mcp.torosaba.net) が、toro-guard の窓口に頼むために足す設定 (ServerImage の toro-mcp の environment に)。
-  # 管理用のツール (guard_* と discord_*) は、トークンのロールが ADMIN_ROLE_IDS (既定: Owner と Admin) の人にだけ見える。
+  # 管理用のツール (guard_* と discord_*) は、いまの Discord のロールが ADMIN_ROLE_IDS (既定: Owner と Admin) の人にだけ見える。
+  # 利用者のトークンをそのまま窓口に渡すので、秘密は増えない。toro-auth には DISCORD_BOT_TOKEN が要る (いまのロールを調べるため)。
   #   - GUARD_CONTROL_URL=http://toro-guard:8090
-  #   - GUARD_CONTROL_TOKEN=${TORO_GUARD_CONTROL_TOKEN}
   #   - ADMIN_ROLE_IDS=100000000000000001,100000000000000002

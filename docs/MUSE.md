@@ -7,7 +7,7 @@ toro-guard が検知して画像と報告文を作り、Muse が定期的に確�
 toro-guard (review) ── 事件を確認待ちに置く
                          ▲
 Muse ──▶ mcp.torosaba.net (TORO Server) ──▶ toro-guard の窓口
-        └ Admin 以上の 90 日トークンでつなぐ。ほかの人には、管理用のツールは見えもしない
+        └ Admin 以上の OAuth のトークンでつなぐ。ほかの人には、管理用のツールは見えもしない
 ```
 
 ## Muse の仕様 (2026-11-04、Muse 本人に聞いた答えと、各社の資料による)
@@ -29,24 +29,30 @@ Muse ──▶ mcp.torosaba.net (TORO Server) ──▶ toro-guard の窓口
 
 ## 前提 (本番に入れたあと)
 
-1. toro-guard を `GUARD_MODE=review`、`CONTROL_TOKEN=<24 文字以上のランダムな値>` で動かす (`compose.example.yaml`)。
-2. TORO-MCP (mcp.torosaba.net) に、同じ値を `GUARD_CONTROL_TOKEN` で渡す。窓口の `http://toro-guard:8090` は、内部のネットワークだけ。
-3. 管理用のツールが見えるのは、トークンのロールが `ADMIN_ROLE_IDS` (既定: TORO サーバーの Owner と Admin) のどれかの人だけ。
+共有の秘密は使わない。**認証は、すべて OAuth 2.0 の利用者のトークン** (auth.torosaba.net が発行したもの) で行う。
 
-## 1. 90 日トークンを作る
+1. toro-guard を `GUARD_MODE=review` で動かす (`compose.example.yaml`)。窓口 (`http://toro-guard:8090`) は内部のネットワークだけで、`AUTH_INTERNAL_URL` (auth の `/introspect`) にトークンを尋ねる。
+2. TORO-MCP (mcp.torosaba.net) に `GUARD_CONTROL_URL=http://toro-guard:8090` を渡す (これを渡すと、管理用のツールが有効になる)。
+3. **auth に `DISCORD_BOT_TOKEN` が要る。** auth は、トークンの確認のたびに (60 秒だけ覚えて)、Bot で**いまの Discord のロール**を調べて返す。Bot トークンが無いと、`roles_source` が `live` にならず、窓口も MCP も、Admin と認めない (安全な側に倒す)。
+4. 管理用のツールを使えるのは、いまのロールが `ADMIN_ROLE_IDS` (既定: TORO サーバーの Owner と Admin) のどれかの人だけ。ロールを外せば、最長 60 秒で使えなくなる。トークンの作り直しは要らない。
 
-1. https://auth.torosaba.net/ に Discord でログインする (Admin 以上のロールを持つアカウント)。
-2. トークンの発行ボタンで、90 日トークンを作る。**値は、このとき 1 度しか表示されない。作り直すと、前のものは使えなくなる。**
-3. OAuth でつなぐと、トークンにロールが入らないので、管理用のツールは見えない。必ず、このトークンを使う (Muse の「Bearer のカスタムコネクター」が、まさにこの形)。
-4. ロールは、トークンを作った時点のものが入る。Admin でなくなった人のトークンは、期限 (90 日) まで、管理用のツールを使えてしまう。外すときは、`GUARD_CONTROL_TOKEN` を変えるか、`ADMIN_ROLE_IDS` から外す。
+```
+Muse ─(OAuth 2.0 のトークン)→ mcp.torosaba.net ─(同じトークン)→ toro-guard ─→ auth /introspect (いまの Discord のロール)
+```
+
+## 1. トークン (OAuth でつなぐ)
+
+**Muse の OAuth のコネクターでつなぐのが、本筋。** Muse に「OAuth 2.0 のコードフローで、リソースは https://mcp.torosaba.net/mcp 」とつなぐよう頼むと、auth.torosaba.net の Discord ログインの画面が開く。Admin 以上のロールを持つアカウントでログインして許可する。auth は、動的なクライアント登録 (DCR) と PKCE (S256) に対応している。
+
+OAuth でつなげないときは、auth のページ (https://auth.torosaba.net/) で 90 日トークンを発行して、Bearer のカスタムコネクターに入れてもよい (値は 1 度しか表示されず、作り直すと前のものは使えなくなる)。どちらのトークンも、ロールは**トークンの値ではなく、確認のたびにいまの Discord で確かめる**ので、同じに扱える。
 
 ## 2. Muse にコネクターを作らせる
 
 Muse に、次のように頼む。
 
-> カスタムコネクターを作って。リモート MCP サーバーの URL は https://mcp.torosaba.net/mcp (Streamable HTTP)。認証は Authorization ヘッダーの Bearer トークン。名前は toro-server。通信してよいホストは mcp.torosaba.net だけ。
+> カスタムコネクターを作って。リモート MCP サーバーの URL は https://mcp.torosaba.net/mcp (Streamable HTTP)。認証は OAuth 2.0 (認可サーバーは https://auth.torosaba.net/)。名前は toro-server。通信してよいホストは mcp.torosaba.net と auth.torosaba.net。
 
-Muse が、トークンの入力ページを出したら、**そこに、1 のトークンを入れる**。つないだら、Muse に `list-tools` をさせ、`ALLOWED_TOOLS` を次の 2 段階で決める。
+Discord ログインの画面が開いたら、Admin 以上のアカウントで許可する。OAuth でつなげないときは、「認証は Authorization ヘッダーの Bearer トークン」に変えて頼み、Muse のトークンの入力ページに、1 の 90 日トークンを入れる。つないだら、Muse に `list-tools` をさせ、`ALLOWED_TOOLS` を次の 2 段階で決める。
 
 | 段階 | `ALLOWED_TOOLS` | 使い方 |
 | --- | --- | --- |
@@ -91,6 +97,7 @@ Muse に次を頼む (間隔は、好みで。`10m` など。Muse が定期タ�
 ## 守っていること
 
 - 管理用のツールは、Admin 以上の人の一覧にしか出ず、呼ばれても、サーバー側で断る。
+- 共有の秘密は無い。窓口 (toro-guard) は、利用者のトークンを auth に尋ねて、Admin かを**自分で**確かめる (TORO-MCP の判断は、ツールを見せるかどうかだけ)。auth に尋ねられないとき、またはロールを確かめられないときは、権限を渡さない (503)。
 - Discord のトークンは、Muse にも TORO-MCP にも渡らない。toro-guard が、DiscordSRV の設定から読んで使う。
 - 信頼する人と op には、ロールバック・ミュート・キックをしない。
 - 操作はすべて、頼んだ人の名前つきで `audit.jsonl` に残り、Discord の操作は、監査ログの理由にも「(by 名前)」が付く。
@@ -98,6 +105,8 @@ Muse に次を頼む (間隔は、好みで。`10m` など。Muse が定期タ�
 
 ## まだ確かめていないこと
 
+- Muse の OAuth のコネクターが、auth.torosaba.net の認可 (DCR・PKCE・リダイレクト先) を通るか。通らないときは、90 日トークンの Bearer でつなぐ。
+- 本番の auth の Bot トークン (`DISCORD_BOT_TOKEN`) で、`/guilds/{id}/members/{user}` が読めること (Bot にサーバーメンバーを読む権限があるか)。
 - Muse に、実際に、このコネクターを作らせること (本番に TORO-MCP の新しい版と toro-guard が無いので、していない)。
 - Muse の `client.py` が、このサーバーの応答 (特に `initialize` の版、`tools/list` の数、202 の応答) を問題なく読めるか。
 - 定期タスクの、承認待ちでの止まり方と、結果の届き方 (Muse 本人の説明による)。

@@ -91,7 +91,7 @@ func cmdRun(log *slog.Logger) error {
 		log.Info("Discord に接続できる", "info", info)
 	}
 	g := NewGuard(cfg, cp, st, ops, sh, rep, log)
-	if cfg.ControlToken != "" {
+	if cfg.ControlAddr != "" {
 		ctl, err := NewControl(ctx, g)
 		if err != nil {
 			return err
@@ -102,7 +102,7 @@ func cmdRun(log *slog.Logger) error {
 			}
 		}()
 	} else {
-		log.Info("操作の窓口は開かない (CONTROL_TOKEN が無い)")
+		log.Info("操作の窓口は開かない (CONTROL_ADDR が空)")
 	}
 	log.Info("起動", "version", version, "mode", cfg.Mode,
 		"burst", fmt.Sprintf("壊 %d / 置 %d / %s", cfg.BreakBurst, cfg.PlaceBurst, cfg.BurstWindow),

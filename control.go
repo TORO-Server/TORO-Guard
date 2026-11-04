@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -38,8 +37,9 @@ import (
 //	GET  /v1/discord/tools?query=                       使える Discord のツール
 //	POST /v1/discord/call {"tool","pathParams","body"}  Discord のツールを呼ぶ (許可したものだけ)
 //
-// 認証は、共有の秘密 (CONTROL_TOKEN) の Bearer。内部のネットワークだけに出す。
-// 頼んだ人は X-Toro-User に入れてもらい、操作は DataDir/audit.jsonl に残す。
+// 認証は OAuth 2.0 の Bearer トークン (利用者のもの。共有の秘密は使わない)。auth の確認の窓口 (/introspect) に尋ね、
+// いまの Discord のロールが ADMIN_ROLE_IDS (Owner と Admin) のどれかの人だけを通す (authz.go)。内部のネットワークだけに出す。
+// 操作は、トークンの持ち主 (Discord の ID と名前) つきで、DataDir/audit.jsonl に残す。
 
 // defaultDiscordAllow は、窓口から呼べる Discord のツール。読むことと、投稿・タグ付けだけ。
 // BAN・キック・ロールの変更・チャンネルやメッセージの削除は含めない。
@@ -49,7 +49,7 @@ const maxBody = 1 << 20
 
 type Control struct {
 	g     *Guard
-	token string
+	authz *Authz
 	allow *regexp.Regexp
 	base  context.Context // 裏で動く操作 (ロールバック) の寿命
 	log   *slog.Logger
@@ -64,7 +64,7 @@ func NewControl(base context.Context, g *Guard) (*Control, error) {
 	if err != nil {
 		return nil, fmt.Errorf("CONTROL_DISCORD_ALLOW: %w", err)
 	}
-	return &Control{g: g, token: g.cfg.ControlToken, allow: re, base: base, log: g.log, audit: filepath.Join(g.cfg.DataDir, "audit.jsonl"), shots: map[string]*shotJob{}}, nil
+	return &Control{g: g, authz: NewAuthz(g.cfg), allow: re, base: base, log: g.log, audit: filepath.Join(g.cfg.DataDir, "audit.jsonl"), shots: map[string]*shotJob{}}, nil
 }
 
 // Handler は窓口の全部の経路。
@@ -85,7 +85,7 @@ func (c *Control) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/screenshots/{job}", c.screenshotResult)
 	mux.HandleFunc("GET /v1/discord/tools", c.wrap(c.discordTools))
 	mux.HandleFunc("POST /v1/discord/call", c.wrap(c.discordCall))
-	return c.authed(mux)
+	return c.authz.Middleware(mux)
 }
 
 // Serve は addr で窓口を開き、ctx が終わるまで受ける。
@@ -107,18 +107,6 @@ func (c *Control) Serve(ctx context.Context, addr string) error {
 	return nil
 }
 
-func (c *Control) authed(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if got == r.Header.Get("Authorization") || subtle.ConstantTimeCompare([]byte(got), []byte(c.token)) != 1 {
-			writeJSONResp(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
-			return
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, maxBody)
-		next.ServeHTTP(w, r)
-	})
-}
-
 func writeJSONResp(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
@@ -131,9 +119,10 @@ type result struct {
 	body any
 }
 
+// who は、トークンの持ち主 (「名前 (id Discord の ID)」)。記録と、Discord の監査ログの理由に使う。
 func (c *Control) who(r *http.Request) string {
-	if u := cleanText(r.Header.Get("X-Toro-User"), 80); u != "" {
-		return u
+	if p := principalOf(r); p != nil {
+		return p.String()
 	}
 	return "unknown"
 }
