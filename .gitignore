@@ -1,0 +1,6 @@
+/toro-guard
+/toro-guard.exe
+*.test
+replay-out/
+replay-sw/
+run-test/

@@ -1,0 +1,50 @@
+# /home/toroserver/docker-compose.yaml に足す (まだ入れていない)。
+# 最初は GUARD_MODE=observe (見つけて記録するだけ)。dry-run (画像と報告文を作るだけ) で確かめてから live にする。
+#
+#   toro-guard-data/ を作って、65532 が書けるようにする:  mkdir toro-guard-data && sudo chown 65532:65532 toro-guard-data
+#   DOCKER_GID は、ホストの docker グループの番号:        getent group docker | cut -d: -f3
+  toro-guard:
+    image: ghcr.io/toro-server/toro-guard:latest
+    container_name: toro-guard
+    user: "65532:65532"
+    # Docker のソケットを使う (toro-main のコンソールに docker attach と同じ方法でつなぐため)。ソケットを持つのは root と同じ力なので、
+    # 他のコンテナには渡さない。RCON を有効にできたら、ソケットは要らなくなる (README の「コンソール」)
+    group_add:
+      - "${DOCKER_GID}"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - tidb
+    environment:
+      - TZ=Asia/Tokyo
+      - GUARD_MODE=observe
+      - DB_HOST=tidb
+      - DB_PASSWORD=${NUXT_DB_PASSWORD:-}
+      # 通報先は、荒らし通報フォーラム。トークンは DiscordSRV の config.yml (BotToken) を読む
+      - REPORT_CHANNEL_ID=1000000000000000001
+      - ROLLBACK_TAG_ID=1000000000000000002
+      # BlueMap は、外に出ずに toro-edge から読む (Host は 3d-map.torosaba.net のまま)
+      - BLUEMAP_URL=http://3d-map.torosaba.net
+      - BLUEMAP_RESOLVE=toro-edge:80
+      - MAP_IDS=main=overworld
+      # 報告に「ワープ ○○ の近く」と書く
+      - WARPS_DIR=/warps
+      # 検知の対象にしない人 (名前をコンマで区切る)。道具を使う人は、コマンドで自動でも外れる
+      - TRUSTED_PLAYERS=
+      # op は信頼する人として扱う (運営が地形を直すのを、荒らしと見ない)
+      - OPS_FILE=/ops.json
+    volumes:
+      - "./toro-guard-data:/data"
+      # DiscordSRV のボットのトークン (BotToken) を読むだけ。ファイル 1 つではなく、フォルダで (DiscordSRV が置き換えて書いても追えるように)
+      - "./main/plugins/DiscordSRV:/discordsrv:ro"
+      - "./main/plugins/Essentials/warps:/warps:ro"
+      - "./main/ops.json:/ops.json:ro"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    networks:
+      - minecraft-network

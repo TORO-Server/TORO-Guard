@@ -1,0 +1,271 @@
+// toro-guard: TORO サーバーの荒らしを見張り、証拠の画像を付けて通報し、ロールバックする。
+//
+//	toro-guard run                    見張りを続ける (GUARD_MODE=observe | dry-run | live)
+//	toro-guard check [-console]       設定・データベース・Discord のトークンとチャンネルを確かめる (何も投稿しない)
+//	toro-guard replay -user NAME -from RFC3339 -to RFC3339 [-out DIR] [-no-shot]
+//	                                  過去の記録に閾値を当てはめ、画像と報告文を DIR に作る (投稿・ロールバックはしない)
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+)
+
+var version = "dev"
+
+func main() {
+	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: toro-guard run | check | replay | healthcheck")
+		os.Exit(2)
+	}
+	var err error
+	switch os.Args[1] {
+	case "run":
+		err = cmdRun(log)
+	case "check":
+		err = cmdCheck(log, os.Args[2:])
+	case "replay":
+		err = cmdReplay(log, os.Args[2:])
+	case "scan":
+		err = cmdScan(log, os.Args[2:])
+	case "healthcheck":
+		err = cmdHealth()
+	case "version":
+		fmt.Println(version)
+	default:
+		err = fmt.Errorf("unknown command %q", os.Args[1])
+	}
+	if err != nil {
+		log.Error("失敗", "err", err)
+		os.Exit(1)
+	}
+}
+
+func cmdRun(log *slog.Logger) error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	cp, err := OpenCP(cfg)
+	if err != nil {
+		return err
+	}
+	defer cp.Close()
+	if err := cp.Ping(ctx); err != nil {
+		return fmt.Errorf("database: %w", err)
+	}
+	st, err := OpenStore(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+
+	var ops *Ops
+	var sh *Shooter
+	var rep *Reporter
+	if cfg.Mode != ModeObserve {
+		ops = &Ops{C: &DockerConsole{Socket: cfg.DockerSocket, Container: cfg.MCContainer}}
+		sh = NewShooter(cfg)
+	}
+	if cfg.Mode == ModeLive {
+		tok, err := LoadBotToken(cfg.DiscordSRVConfig)
+		if err != nil {
+			return fmt.Errorf("discordsrv token: %w", err)
+		}
+		rep, err = NewReporter(tok, cfg.ReportChannelID, cfg.RollbackTagID)
+		if err != nil {
+			return err
+		}
+		info, err := rep.Check(ctx)
+		if err != nil {
+			return fmt.Errorf("discord: %w", err)
+		}
+		log.Info("Discord に接続できる", "info", info)
+	}
+	g := NewGuard(cfg, cp, st, ops, sh, rep, log)
+	log.Info("起動", "version", version, "mode", cfg.Mode,
+		"burst", fmt.Sprintf("壊 %d / 置 %d / %s", cfg.BreakBurst, cfg.PlaceBurst, cfg.BurstWindow),
+		"sustained", fmt.Sprintf("壊 %d / %s", cfg.SustainedBreaks, cfg.SustainedWindow),
+		"trusted", len(cfg.TrustedPlayers), "warps", len(g.warps))
+	touchHealth(cfg)
+	go keepHealth(ctx, cfg)
+	return g.Run(ctx)
+}
+
+func cmdCheck(log *slog.Logger, args []string) error {
+	fs := flag.NewFlagSet("check", flag.ExitOnError)
+	console := fs.Bool("console", false, "Minecraft のコンソールに `bluemap` (状態の表示だけ) を送って確かめる")
+	_ = fs.Parse(args)
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	cp, err := OpenCP(cfg)
+	if err != nil {
+		return err
+	}
+	defer cp.Close()
+	if err := cp.Ping(ctx); err != nil {
+		return fmt.Errorf("database: %w", err)
+	}
+	n, err := cp.MaxRowID(ctx)
+	if err != nil {
+		return fmt.Errorf("database: %w", err)
+	}
+	fmt.Printf("database: ok (%s:%s/%s, 最後の行 %d)\n", cfg.DBHost, cfg.DBPort, cfg.DBName, n)
+
+	tok, err := LoadBotToken(cfg.DiscordSRVConfig)
+	if err != nil {
+		return fmt.Errorf("discordsrv token: %w", err)
+	}
+	rep, err := NewReporter(tok, cfg.ReportChannelID, cfg.RollbackTagID)
+	if err != nil {
+		return err
+	}
+	info, err := rep.Check(ctx)
+	if err != nil {
+		return fmt.Errorf("discord: %w", err)
+	}
+	fmt.Println("discord: ok (" + info + ")  ※何も投稿していません")
+
+	if *console {
+		ops := Ops{C: &DockerConsole{Socket: cfg.DockerSocket, Container: cfg.MCContainer}}
+		for _, mapID := range cfg.MapIDs {
+			idle, err := ops.BlueMapIdle(ctx, mapID)
+			if err != nil {
+				return fmt.Errorf("console: %w", err)
+			}
+			fmt.Printf("console: ok (bluemap %s: 更新済みで待機中=%v)\n", mapID, idle)
+		}
+	}
+	fmt.Printf("mode=%s  warps=%d\n", cfg.Mode, len(LoadWarps(cfg.WarpsDir)))
+	return nil
+}
+
+func cmdReplay(log *slog.Logger, args []string) error {
+	fs := flag.NewFlagSet("replay", flag.ExitOnError)
+	user := fs.String("user", "", "プレイヤー名")
+	from := fs.String("from", "", "開始 (RFC3339。例 2026-11-04T10:50:00+09:00)")
+	to := fs.String("to", "", "終了 (RFC3339)")
+	out := fs.String("out", "replay-out", "出力先のフォルダ")
+	noShot := fs.Bool("no-shot", false, "BlueMap の画面を撮らない (真上の図だけ)")
+	_ = fs.Parse(args)
+	if *user == "" || *from == "" || *to == "" {
+		return fmt.Errorf("-user, -from, -to are required")
+	}
+	t0, err := time.Parse(time.RFC3339, *from)
+	if err != nil {
+		return err
+	}
+	t1, err := time.Parse(time.RFC3339, *to)
+	if err != nil {
+		return err
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	cfg.Mode = ModeDryRun // replay は、どんなときも何も投稿せず、ロールバックもしない
+	abs, _ := filepath.Abs(*out)
+	cfg.DataDir = abs
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	cp, err := OpenCP(cfg)
+	if err != nil {
+		return err
+	}
+	defer cp.Close()
+	u, err := cp.UserByName(ctx, *user)
+	if err != nil {
+		return fmt.Errorf("user %s: %w", *user, err)
+	}
+	events, err := cp.EventsFor(ctx, u.ID, t0.Unix(), t1.Unix())
+	if err != nil {
+		return err
+	}
+	det := NewDetector(cfg)
+	var first *Trigger
+	for _, e := range events {
+		if t := det.Feed(e); t != nil {
+			first = t
+			break
+		}
+	}
+	fmt.Printf("events=%d  user=%s uuid=%s\n", len(events), u.Name, u.UUID)
+	if first == nil {
+		fmt.Println("閾値を超えなかった (検知されない)")
+		return nil
+	}
+	fmt.Printf("検知: %s の %s  %s\n", u.Name, time.Unix(first.Time, 0).In(jst).Format("15:04:05"), first.String())
+
+	st, err := OpenStore(abs)
+	if err != nil {
+		return err
+	}
+	var sh *Shooter
+	if !*noShot {
+		sh = NewShooter(cfg)
+	}
+	g := NewGuard(cfg, cp, st, nil, sh, nil, log)
+	inc := &Incident{
+		ID:     fmt.Sprintf("replay-%s-%s", time.Unix(first.Time, 0).In(jst).Format("20060102-150405"), u.Name),
+		UserID: u.ID, Name: u.Name, UUID: u.UUID,
+		Start: first.Time - int64(first.Window), Last: t1.Unix(), Trigger: first.String(),
+	}
+	res, err := g.processWindow(ctx, inc, t1.Unix())
+	if err != nil {
+		return err
+	}
+	fmt.Println("出力:", res.Dir)
+	fmt.Println("-----")
+	fmt.Println(res.Report)
+	return nil
+}
+
+// healthcheck: 見張りが回っていれば、DataDir/health の更新時刻が新しい。
+func cmdHealth() error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	fi, err := os.Stat(filepath.Join(cfg.DataDir, "health"))
+	if err != nil {
+		return err
+	}
+	if time.Since(fi.ModTime()) > 2*time.Minute {
+		return fmt.Errorf("health file is stale: %s", fi.ModTime())
+	}
+	return nil
+}
+
+func touchHealth(cfg *Config) {
+	_ = os.MkdirAll(cfg.DataDir, 0o755)
+	_ = os.WriteFile(filepath.Join(cfg.DataDir, "health"), []byte(time.Now().Format(time.RFC3339)), 0o644)
+}
+
+func keepHealth(ctx context.Context, cfg *Config) {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			touchHealth(cfg)
+		}
+	}
+}
