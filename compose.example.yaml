@@ -7,7 +7,7 @@
   # トークンはここに置かない: toro-guard が DiscordSRV の BotToken を、呼ぶたびに authOverride で渡す。
   # DISCORD_BOT_TOKEN は起動に要るだけの印 (使わない)。外には公開せず (ports なし)、必要なツールだけ登録する。
   discord-mcp:
-    image: ghcr.io/cafe-horizon/discord-mcp:latest
+    image: ghcr.io/cafe-horizon/discord-mcp:1.3.1@sha256:929f70cd1db94fe90fa0772312a30a4f55f15f5884e07d6d1f8109c263b05516
     container_name: discord-mcp
     restart: unless-stopped
     read_only: true
