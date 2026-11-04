@@ -42,7 +42,7 @@ Muse ─(OAuth 2.0 のトークン)→ mcp.torosaba.net ─(同じトークン)�
 
 ## 1. トークン (OAuth でつなぐ)
 
-**Muse の OAuth のコネクターでつなぐのが、本筋。** Muse に「OAuth 2.0 のコードフローで、リソースは https://mcp.torosaba.net/mcp 」とつなぐよう頼むと、auth.torosaba.net の Discord ログインの画面が開く。Admin 以上のロールを持つアカウントでログインして許可する。auth は、動的なクライアント登録 (DCR) と PKCE (S256) に対応している。
+**Muse の OAuth のコネクターでつなぐのが、本筋。** Muse に「OAuth 2.0 のコードフローで、リソースは https://mcp.torosaba.net/ 」とつなぐよう頼むと、auth.torosaba.net の Discord ログインの画面が開く。Admin 以上のロールを持つアカウントでログインして許可する。auth は、動的なクライアント登録 (DCR) と PKCE (S256) に対応している。
 
 OAuth でつなげないときは、auth のページ (https://auth.torosaba.net/) で 90 日トークンを発行して、Bearer のカスタムコネクターに入れてもよい (値は 1 度しか表示されず、作り直すと前のものは使えなくなる)。どちらのトークンも、ロールは**トークンの値ではなく、確認のたびにいまの Discord で確かめる**ので、同じに扱える。
 
@@ -52,7 +52,7 @@ OAuth でつなげないときは、auth のページ (https://auth.torosaba.net
 
 Muse に、次のように頼む。
 
-> カスタムコネクターを作って。リモート MCP サーバーの URL は https://mcp.torosaba.net/mcp (Streamable HTTP)。認証は OAuth 2.0 (認可サーバーは https://auth.torosaba.net/)。名前は toro-server。通信してよいホストは mcp.torosaba.net と auth.torosaba.net。
+> カスタムコネクターを作って。リモート MCP サーバーの URL は https://mcp.torosaba.net/ (Streamable HTTP)。認証は OAuth 2.0 (認可サーバーは https://auth.torosaba.net/)。名前は toro-server。通信してよいホストは mcp.torosaba.net と auth.torosaba.net。
 
 Discord ログインの画面が開いたら、Admin 以上のアカウントで許可する。OAuth でつなげないときは、「認証は Authorization ヘッダーの Bearer トークン」に変えて頼み、Muse のトークンの入力ページに、1 の 90 日トークンを入れる。つないだら、Muse に `list-tools` をさせ、`ALLOWED_TOOLS` を次の 2 段階で決める。
 
@@ -105,10 +105,25 @@ Muse に次を頼む (間隔は、好みで。`10m` など。Muse が定期タ�
 - 操作はすべて、頼んだ人の名前つきで `audit.jsonl` に残り、Discord の操作は、監査ログの理由にも「(by 名前)」が付く。
 - 利用者が書いた文章 (発言・Discord の本文・名前) は、「信頼できない入力」の注意を付けて返す。それでも、AI は、書かれた指示に従う可能性がある。**最初は、書き込みを Ask にして、人の確認を挟む。**
 
+## いまの状態 (2026-11-04)
+
+コネクター `custom.toro-server` と、定期タスク「TORO 荒らし確認」(10 分ごと) が動いている。`ALLOWED_TOOLS` は読み取りの 14 個と `guard_report_incident` の 15 個。
+
+- Muse は、ブロックの事件で、報告文・実物の画像・コマンドの有無をすべて確かめて「荒らし」と判断したときだけ、荒らし通報フォーラムへ、画像付きで投稿する。投稿にはロールバックのコマンドが載る。
+- **ロールバックは、人がコマンドを実行する。** Muse は `guard_rollback` を呼べない。
+- チャットの事件、「正当な作業の疑い」「判断できない」は、投稿せず、Muse のチャットに知らせる。ID が `test-` で始まる事件は、投稿しない。
+- カスタムコネクターには、Allow / Ask / Deny の設定が無い (Muse の説明)。呼べるツールは `ALLOWED_TOOLS` だけで決まり、投稿は承認なしで行われる。
+- コマンドの `t:` は「実行する時から何秒前まで」なので、通報のときに計算し直す。そこから 1 時間 (`reportCmdMargin`) は、そのまま実行できる。
+
+本番で確かめたこと:
+
+- OAuth のコネクターは、auth.torosaba.net の認可 (DCR・PKCE) を通る。スコープは `mcp`。Admin のアカウントで 22 個のツールが見える。
+- Muse の `client.py` は、既定の User-Agent だと Cloudflare の Error 1010 で断られる。`User-Agent: muse-custom-connector/1.0` を付けて通した。
+- 読み取りの呼び出しは、画像も含めて 1 回 2〜4 秒で返る。
+- 画像は、Muse が足した `extract-images` (`client.py`) で保存して開ける。検証の事件で、実物の画像を見て、根拠つきで判断した。
+- 定期タスクは `notified.txt` に通知済みの ID を残す。読むだけの段階では、事件が pending のまま残るので、これが無いと 10 分ごとに同じ通知が届く。
+
 ## まだ確かめていないこと
 
-- Muse の OAuth のコネクターが、auth.torosaba.net の認可 (DCR・PKCE・リダイレクト先) を通るか。通らないときは、90 日トークンの Bearer でつなぐ。
-- 本番の auth の Bot トークン (`DISCORD_BOT_TOKEN`) で、`/guilds/{id}/members/{user}` が読めること (Bot にサーバーメンバーを読む権限があるか)。
-- Muse に、実際に、このコネクターを作らせること (本番に TORO-MCP の新しい版と toro-guard が無いので、していない)。
-- Muse の `client.py` が、このサーバーの応答 (特に `initialize` の版、`tools/list` の数、202 の応答) を問題なく読めるか。
-- 定期タスクの、承認待ちでの止まり方と、結果の届き方 (Muse 本人の説明による)。
+- `guard_report_incident` の、フォーラムへの実際の投稿 (画像の添付とタグを含む)。
+- 定期タスクの、承認待ちでの止まり方 (Muse 本人の説明による)。

@@ -22,6 +22,7 @@ type Outcome struct {
 	AI          *Verdict // AI の判定 (使わないときは nil)
 	AIError     string
 	Skipped     string // ロールバックをしなかった理由
+	CmdUntil    int64  // Cmd の t: で足りる期限 (人が後で実行するときだけ。0 なら書かない)
 }
 
 func verdictJP(v string) string {
@@ -101,6 +102,9 @@ func BuildReport(in ReportInput) string {
 		fmt.Fprintf(&b, "**対応**: 自動ロールバックはしていません (%s)。運営が確認してください。ロールバックするときは `%s`\n", in.Out.Skipped, in.Out.Cmd)
 	case in.Out.RolledBack:
 		fmt.Fprintf(&b, "**対応**: CoreProtect で自動ロールバック済み (%s / %s 件)\n", comma(in.Out.RolledDone), comma(in.Out.RolledTotal))
+	case in.Out.Planned && in.Out.CmdUntil > 0:
+		fmt.Fprintf(&b, "**ロールバック (未実行)**: `%s`\n", in.Out.Cmd)
+		fmt.Fprintf(&b, "%s までに実行してください。それより後は、t: を「実行する時刻 − %s」より長くしてください。\n", fmtT(in.Out.CmdUntil), fmtT(s.From))
 	case in.Out.Planned:
 		fmt.Fprintf(&b, "**対応 (予定)**: `%s`\n", in.Out.Cmd)
 	case in.Out.Error != "":

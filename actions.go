@@ -14,6 +14,9 @@ import (
 // 窓口 (control) から頼まれる操作。人が (または AI が) 確かめて決めたことを、ここで実行する。
 // どれも、動かし方が review か live のときだけ受ける。by は、頼んだ人 (記録に残す)。
 
+// reportCmdMargin は、通報に書くコマンドの t: に足す秒数。運営がこの時間のうちに実行すれば、荒らしの始まりまで届く。
+const reportCmdMargin = 3600
+
 var (
 	// ErrForbidden は、してはいけない相手 (信頼する人・op) や、受け付けない動かし方のとき。
 	ErrForbidden = errors.New("forbidden")
@@ -92,7 +95,11 @@ func (g *Guard) ReportIncident(ctx context.Context, id, by, note string) (*Recor
 		if err != nil {
 			return nil, fmt.Errorf("stats: %w", err)
 		}
-		out := Outcome{Cmd: rec.RollbackCmd, RestoreCmd: rec.RestoreCmd, RolledBack: rec.RolledBack, AI: rec.AI, Planned: !rec.RolledBack}
+		// t: は「実行するときから何秒前まで」なので、検知のときの秒数のままだと、後で実行すると荒らしの始まりに届かない
+		now := time.Now().Unix()
+		seconds := int(now-rec.Start) + reportCmdMargin
+		rec.RollbackCmd, rec.RestoreCmd = RollbackCmd(rec.Name, seconds, rec.World), RestoreCmd(rec.Name, seconds, rec.World)
+		out := Outcome{Cmd: rec.RollbackCmd, RestoreCmd: rec.RestoreCmd, RolledBack: rec.RolledBack, AI: rec.AI, Planned: !rec.RolledBack, CmdUntil: now + reportCmdMargin}
 		if rec.RolledBack {
 			done, total, derr := g.cp.RolledBack(ctx, rec.UserID, rec.Start-2, rec.End)
 			if derr == nil {
@@ -140,6 +147,7 @@ func (g *Guard) ReportIncident(ctx context.Context, id, by, note string) (*Recor
 	g.mu.Unlock()
 	return g.update(id, func(r *Record) {
 		r.State, r.Reported, r.Thread = StateReported, true, thread
+		r.RollbackCmd, r.RestoreCmd = rec.RollbackCmd, rec.RestoreCmd
 		r.decide(now, by, "report", cleanText(note, 300))
 	})
 }

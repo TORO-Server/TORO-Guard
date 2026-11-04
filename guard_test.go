@@ -233,6 +233,12 @@ func TestReportText(t *testing.T) {
 	if !strings.Contains(dry, "試運転") || !strings.Contains(dry, "対応 (予定)") {
 		t.Fatalf("dry-run text: %s", dry)
 	}
+	later := BuildReport(ReportInput{Stats: s, Out: Outcome{Planned: true, Cmd: "co rollback u:fuuty119 t:4015s r:#main", CmdUntil: s.To + 3600}, Mode: ModeReview})
+	for _, want := range []string{"ロールバック (未実行)", "t:4015s", "までに実行してください"} {
+		if !strings.Contains(later, want) {
+			t.Errorf("missing %q in:\n%s", want, later)
+		}
+	}
 }
 
 func TestComma(t *testing.T) {
