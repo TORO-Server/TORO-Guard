@@ -29,13 +29,17 @@ type Guard struct {
 	mu         sync.Mutex
 	suppressed map[int]int64 // user → この時刻まで、検知しても無視する (道具を使った人、信頼する人)
 	queue      chan *Incident
+	busy       map[string]string // 事件の ID → 裏で動いている操作 (g.mu を持って触る)
+
+	opMu  sync.Mutex // コンソールとブラウザを使う処理 (事件の処理、窓口からの操作) を 1 つずつにする
+	recMu sync.Mutex // 事件の記録 (record.json) の読み書き
 }
 
 func NewGuard(cfg *Config, cp *CP, st *Store, ops *Ops, sh *Shooter, rep *Reporter, log *slog.Logger) *Guard {
 	return &Guard{
 		cfg: cfg, cp: cp, det: NewDetector(cfg), cdet: NewChatDetector(cfg), ai: NewAI(cfg), store: st, ops: ops, shooter: sh, reporter: rep,
 		warps: LoadWarps(cfg.WarpsDir), log: log,
-		suppressed: map[int]int64{}, queue: make(chan *Incident, 16),
+		suppressed: map[int]int64{}, queue: make(chan *Incident, 16), busy: map[string]string{},
 	}
 }
 
@@ -324,20 +328,27 @@ func (g *Guard) worker(ctx context.Context) {
 			delete(g.store.S.Incidents, inc.Key())
 			_ = g.store.Save()
 			g.mu.Unlock()
-			if inc.Kind == "chat" {
-				if res, err := g.ProcessChat(ctx, inc, time.Now().Unix()); err != nil {
-					g.log.Error("チャットの事件の処理に失敗", "incident", inc.ID, "err", err)
-				} else {
-					g.log.Info("チャットの事件を処理した", "incident", inc.ID, "dir", res.Dir, "posted", res.ThreadID != "", "muted", res.Muted)
-				}
-				continue
-			}
-			if res, err := g.Process(ctx, inc); err != nil {
-				g.log.Error("事件の処理に失敗", "incident", inc.ID, "err", err)
-			} else {
-				g.log.Info("事件を処理した", "incident", inc.ID, "dir", res.Dir, "posted", res.ThreadID != "", "rolled_back", res.Out.RolledBack)
-			}
+			g.handle(ctx, inc)
 		}
+	}
+}
+
+// handle は閉じた事件を 1 件処理する。窓口からの操作とコンソール・ブラウザを取り合わないよう、g.opMu を持つ。
+func (g *Guard) handle(ctx context.Context, inc *Incident) {
+	g.opMu.Lock()
+	defer g.opMu.Unlock()
+	if inc.Kind == "chat" {
+		if res, err := g.ProcessChat(ctx, inc, time.Now().Unix()); err != nil {
+			g.log.Error("チャットの事件の処理に失敗", "incident", inc.ID, "err", err)
+		} else {
+			g.log.Info("チャットの事件を処理した", "incident", inc.ID, "dir", res.Dir, "posted", res.ThreadID != "", "muted", res.Muted)
+		}
+		return
+	}
+	if res, err := g.Process(ctx, inc); err != nil {
+		g.log.Error("事件の処理に失敗", "incident", inc.ID, "err", err)
+	} else {
+		g.log.Info("事件を処理した", "incident", inc.ID, "dir", res.Dir, "posted", res.ThreadID != "", "rolled_back", res.Out.RolledBack)
 	}
 }
 
@@ -454,31 +465,32 @@ func (g *Guard) processWindow(ctx context.Context, inc *Incident, end int64) (*R
 
 	// 4. 報告文と画像
 	var files []ReportFile
-	var desc []string
-	add := func(name, path, what string) {
-		if path == "" {
-			return
+	for _, c := range []struct{ name, path string }{{"damage.png", damage}, {"closeup.png", closeup}, {"restored.png", restored}} {
+		if c.path != "" {
+			files = append(files, ReportFile{Name: c.name, Path: c.path})
 		}
-		files = append(files, ReportFile{Name: name, Path: path})
-		desc = append(desc, fmt.Sprintf("%d枚目 %s", len(files), what))
 	}
-	add("damage.png", damage, "被害の全体 (赤い線 = 壊された列)")
-	add("closeup.png", closeup, "いちばん壊された所")
-	add("restored.png", restored, "ロールバック後")
-	if len(files) < 2 {
-		add("heatmap.png", heat, "壊した場所 (真上から)")
+	if len(files) < 2 && heat != "" {
+		files = append(files, ReportFile{Name: "heatmap.png", Path: heat})
 	}
 	res.Images = files
-
-	warp := ""
-	if w, d, ok := Nearest(g.warps, stats.World, float64(stats.X0+stats.X1)/2, float64(stats.Z0+stats.Z1)/2); ok {
-		warp = WarpText(w, d)
-	}
-	res.Report = BuildReport(ReportInput{Stats: stats, Trigger: inc.Trigger, Warp: warp, Out: out, Images: desc, Mode: g.cfg.Mode, Center: &cam})
+	res.Report = g.blockReport(stats, inc.Trigger, out, files, cam)
 	if err := os.WriteFile(filepath.Join(dir, "report.md"), []byte(res.Report), 0o644); err != nil {
 		return res, err
 	}
 	_ = writeJSON(filepath.Join(dir, "incident.json"), map[string]any{"incident": inc, "stats": summaryOf(stats), "outcome": out})
+	rec := &Record{
+		ID: inc.ID, Kind: "block", Name: inc.Name, UUID: inc.UUID, UserID: inc.UserID,
+		Created: now, Start: inc.Start, End: end, World: stats.World, Trigger: inc.Trigger,
+		State: StatePending, RolledBack: out.RolledBack,
+		Breaks: stats.Breaks, Places: stats.Places, RollbackCmd: out.Cmd, RestoreCmd: out.RestoreCmd, AI: out.AI,
+	}
+	for _, f := range files {
+		rec.Images = append(rec.Images, f.Name)
+	}
+	if out.RolledBack {
+		rec.decide(now, "toro-guard", "rollback", fmt.Sprintf("%d/%d", out.RolledDone, out.RolledTotal))
+	}
 
 	// 5. 通報 (live だけ)
 	if g.cfg.Mode == ModeLive && g.reporter != nil {
@@ -498,8 +510,32 @@ func (g *Guard) processWindow(ctx context.Context, inc *Incident, end int64) (*R
 		g.store.S.Threads[key] = ThreadRef{ThreadID: id, At: now}
 		_ = g.store.Save()
 		g.mu.Unlock()
+		rec.State, rec.Reported, rec.Thread = StateReported, true, id
+		rec.decide(now, "toro-guard", "report", "")
+	}
+	if err := saveRecord(dir, rec); err != nil {
+		g.log.Warn("事件の記録が書けない", "incident", inc.ID, "err", err)
 	}
 	return res, nil
+}
+
+// blockReport はブロックの荒らしの報告文。ロールバックや通報のあとにも、同じ形で作り直す。
+func (g *Guard) blockReport(stats *Stats, trigger string, out Outcome, files []ReportFile, cam Cam) string {
+	what := map[string]string{
+		"damage.png":   "被害の全体 (赤い線 = 壊された列)",
+		"closeup.png":  "いちばん壊された所",
+		"restored.png": "ロールバック後",
+		"heatmap.png":  "壊した場所 (真上から)",
+	}
+	var desc []string
+	for i, f := range files {
+		desc = append(desc, fmt.Sprintf("%d枚目 %s", i+1, what[f.Name]))
+	}
+	warp := ""
+	if w, d, ok := Nearest(g.warps, stats.World, float64(stats.X0+stats.X1)/2, float64(stats.Z0+stats.Z1)/2); ok {
+		warp = WarpText(w, d)
+	}
+	return BuildReport(ReportInput{Stats: stats, Trigger: trigger, Warp: warp, Out: out, Images: desc, Mode: g.cfg.Mode, Center: &cam})
 }
 
 // bluemapShot は、書き出し → BlueMap の更新 → 待つ → 撮る。失敗しても事件の処理は続ける (空の文字列を返す)。

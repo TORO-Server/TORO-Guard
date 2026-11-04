@@ -79,7 +79,7 @@ func cmdRun(log *slog.Logger) error {
 		ops = &Ops{C: &DockerConsole{Socket: cfg.DockerSocket, Container: cfg.MCContainer}}
 		sh = NewShooter(cfg)
 	}
-	if cfg.Mode == ModeLive {
+	if cfg.Mode == ModeLive || cfg.Mode == ModeReview {
 		rep, err = reporterFor(cfg)
 		if err != nil {
 			return err
@@ -91,6 +91,19 @@ func cmdRun(log *slog.Logger) error {
 		log.Info("Discord に接続できる", "info", info)
 	}
 	g := NewGuard(cfg, cp, st, ops, sh, rep, log)
+	if cfg.ControlToken != "" {
+		ctl, err := NewControl(ctx, g)
+		if err != nil {
+			return err
+		}
+		go func() {
+			if err := ctl.Serve(ctx, cfg.ControlAddr); err != nil {
+				log.Error("操作の窓口が止まった", "err", err)
+			}
+		}()
+	} else {
+		log.Info("操作の窓口は開かない (CONTROL_TOKEN が無い)")
+	}
 	log.Info("起動", "version", version, "mode", cfg.Mode,
 		"burst", fmt.Sprintf("壊 %d / 置 %d / %s", cfg.BreakBurst, cfg.PlaceBurst, cfg.BurstWindow),
 		"sustained", fmt.Sprintf("壊 %d / %s", cfg.SustainedBreaks, cfg.SustainedWindow),

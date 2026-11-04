@@ -219,8 +219,8 @@ func (c *CP) RecentEditCommand(ctx context.Context, user int, since int64) (stri
 }
 
 type MatCount struct {
-	Material string
-	Count    int
+	Material string `json:"material"`
+	Count    int    `json:"count"`
 }
 
 type Column struct {

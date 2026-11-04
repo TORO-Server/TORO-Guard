@@ -126,6 +126,7 @@ type DiscordCall struct {
 	Tool       string         // 例: discord_create_message
 	PathParams map[string]any // 例: {"channel_id": "..."}
 	Body       map[string]any
+	Query      map[string]any   // URL の ?name=value (例: {"limit": 20})
 	Files      []map[string]any // {filename, contentType, contentBase64}
 	Fields     string           // 返事から取り出す項目 (トークンの節約)
 	Auth       string           // Authorization ヘッダの値 ("Bot ...")。サーバーのトークンの代わりに使う
@@ -140,6 +141,9 @@ func (m *MCP) Discord(ctx context.Context, c DiscordCall) (string, error) {
 	}
 	if c.Body != nil {
 		args["body"] = c.Body
+	}
+	if len(c.Query) > 0 {
+		args["queryParams"] = c.Query
 	}
 	if len(c.Files) > 0 {
 		args["files"] = c.Files

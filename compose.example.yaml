@@ -27,8 +27,9 @@
       - DISCORD_MCP_ENABLE_GATEWAY=false
       - DISCORD_MCP_ALLOW_FILE_PATH=false
       - DISCORD_MCP_ALLOW_FILE_URL=false
-      # 通報に要る操作 (自分の確認・チャンネルの確認・投稿を立てる・書き足す・タグを付ける) だけ
-      - DISCORD_MCP_INCLUDE_TOOLS=^discord_(call_tool|search_tools|get_my_user|get_channel|create_thread|create_message|update_channel)$$
+      # 通報に要る操作と、Muse など (Admin 以上) が窓口経由で使う読み取りだけ。BAN・キック・ロール・削除は含めない。
+      # toro-guard の CONTROL_DISCORD_ALLOW (窓口の許可) も、同じ範囲にしてある (二重に絞る)
+      - DISCORD_MCP_INCLUDE_TOOLS=^discord_(call_tool|search_tools|get_my_user|get_channel|list_channel_messages|list_messages|get_message|get_channel_message|create_message|create_thread|update_channel|list_guild_channels|list_guild_roles|get_guild_member|search_guild_members|list_active_guild_threads|list_thread_members)$$
     networks:
       - minecraft-network
 
@@ -53,7 +54,11 @@
       - discord-mcp
     environment:
       - TZ=Asia/Tokyo
+      # observe → dry-run → review (人や Muse が見て決める) → live (自動でロールバックまで) の順に上げる
       - GUARD_MODE=observe
+      # 操作の窓口 (:8090、内部のネットワークだけ。ports は付けない)。TORO-MCP が、Admin 以上の人の頼みを取り次ぐ。
+      # 24 文字以上のランダムな値を .env に置き (リポジトリには置かない)、toro-mcp にも同じ値を渡す。空なら窓口は開かない
+      - CONTROL_TOKEN=${TORO_GUARD_CONTROL_TOKEN:-}
       - DB_HOST=tidb
       - DB_PASSWORD=${NUXT_DB_PASSWORD:-}
       # 通報先は、荒らし通報フォーラム。トークンは DiscordSRV の config.yml (BotToken) を読み、Discord-MCP に渡す
@@ -83,3 +88,9 @@
       - "/var/run/docker.sock:/var/run/docker.sock"
     networks:
       - minecraft-network
+
+  # TORO-MCP (mcp.torosaba.net) が、toro-guard の窓口に頼むために足す設定 (ServerImage の toro-mcp の environment に)。
+  # 管理用のツール (guard_* と discord_*) は、トークンのロールが ADMIN_ROLE_IDS (既定: Owner と Admin) の人にだけ見える。
+  #   - GUARD_CONTROL_URL=http://toro-guard:8090
+  #   - GUARD_CONTROL_TOKEN=${TORO_GUARD_CONTROL_TOKEN}
+  #   - ADMIN_ROLE_IDS=100000000000000001,100000000000000002

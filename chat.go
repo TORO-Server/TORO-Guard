@@ -48,6 +48,29 @@ func (c *CP) ChatFor(ctx context.Context, user int, from, to int64) ([]ChatMsg, 
 	return scanChat(rows)
 }
 
+// ChatSince は since 以降の発言を、新しいほうから最大 limit 件取って、時間の順に返す。user が 0 でなければ、その人だけ。
+func (c *CP) ChatSince(ctx context.Context, since int64, user, limit int) ([]ChatMsg, error) {
+	q := "SELECT rowid, time, user, message FROM " + c.p + "chat WHERE time >= ?"
+	args := []any{since}
+	if user != 0 {
+		q += " AND user = ?"
+		args = append(args, user)
+	}
+	rows, err := c.db.QueryContext(ctx, q+" ORDER BY rowid DESC LIMIT ?", append(args, limit)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	msgs, err := scanChat(rows)
+	if err != nil {
+		return nil, err
+	}
+	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+		msgs[i], msgs[j] = msgs[j], msgs[i]
+	}
+	return msgs, nil
+}
+
 func scanChat(rows *sql.Rows) ([]ChatMsg, error) {
 	var out []ChatMsg
 	for rows.Next() {
@@ -428,6 +451,21 @@ func (g *Guard) ProcessChat(ctx context.Context, inc *Incident, end int64) (*Cha
 		g.store.S.Threads[key] = ThreadRef{ThreadID: id, At: now}
 		_ = g.store.Save()
 		g.mu.Unlock()
+	}
+	rec := &Record{
+		ID: inc.ID, Kind: "chat", Name: inc.Name, UUID: inc.UUID, UserID: inc.UserID,
+		Created: time.Now().Unix(), Start: inc.Start, End: end, Trigger: inc.Trigger,
+		State: StatePending, Messages: len(msgs), Muted: res.Muted,
+	}
+	if res.ThreadID != "" {
+		rec.State, rec.Reported, rec.Thread = StateReported, true, res.ThreadID
+		rec.decide(rec.Created, "toro-guard", "report", "")
+	}
+	if res.Muted {
+		rec.decide(rec.Created, "toro-guard", "mute", "")
+	}
+	if err := saveRecord(dir, rec); err != nil {
+		g.log.Warn("事件の記録が書けない", "incident", inc.ID, "err", err)
 	}
 	return res, nil
 }

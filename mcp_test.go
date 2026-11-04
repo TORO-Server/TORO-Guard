@@ -32,7 +32,11 @@ func (f *fakeMCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	args := req.Params.Arguments
 	f.calls = append(f.calls, map[string]any{"name": req.Params.Name, "args": args})
-	text, isErr := f.reply(args["toolName"].(string), args)
+	tool, _ := args["toolName"].(string)
+	if tool == "" { // discord_search_tools のように、直接呼ぶツール
+		tool = req.Params.Name
+	}
+	text, isErr := f.reply(tool, args)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{
 		"content": []map[string]any{{"type": "text", "text": text}}, "isError": isErr}})

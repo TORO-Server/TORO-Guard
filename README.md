@@ -35,9 +35,36 @@ CoreProtect (TiDB) ── 3 秒ごとに新しい行 ──▶ 検知 (人の手
 | --- | --- | --- |
 | `observe` (既定) | 検知して、まとめ (`incident.json`) と真上の図を `DATA_DIR/reports/` に置く | コンソールへの送信、BlueMap の画面、Discord、ロールバック |
 | `dry-run` | `observe` に加えて、`save-all flush` と `bluemap update` を送り、BlueMap の画面を撮り、報告文 (`report.md`) を作る。やる予定のロールバックのコマンドを報告文に書く | Discord に投稿しない、ロールバックしない |
-| `live` | すべて。ロールバック → 画像 → 投稿 | — |
+| `review` | `dry-run` と同じに画像と報告文を作り、事件を「確認待ち (pending)」に置く。**人か AI (Muse など) が、操作の窓口から、通報・ロールバック・却下・ミュート・キックを決める** | 自分では、投稿・ロールバック・キックをしない |
+| `live` | すべて。ロールバック → 画像 → 投稿 (窓口の操作も受ける) | — |
 
-**まず `observe` で数日、次に `dry-run` で 1 度画像を確かめてから、`live` にする。**
+**まず `observe` で数日、次に `dry-run` で 1 度画像を確かめてから、`review` (人や Muse が見て決める) か `live` にする。**
+
+## 操作の窓口 (control) と Muse
+
+`CONTROL_TOKEN` を設定すると、内部のネットワークに、操作の窓口 (`:8090`) を開く。人や AI が、事件を確かめて、通報・ロールバック・却下を決めるための入り口で、[TORO-MCP](https://github.com/TORO-Server/TORO-MCP) (mcp.torosaba.net) が、**auth.torosaba.net で Admin 以上と確かめた人の頼みだけ**を取り次ぐ。
+
+```
+Muse など ──(90 日トークン)──▶ mcp.torosaba.net ──(Admin か確かめる)──▶ toro-guard :8090 ──▶ CoreProtect / BlueMap / コンソール / Discord-MCP
+```
+
+| 経路 | 内容 |
+| --- | --- |
+| `GET /v1/status` | 動かし方、確認待ちの数、できること |
+| `GET /v1/incidents?state=pending` `GET /v1/incidents/{id}` `GET /v1/incidents/{id}/images/{name}` | 事件の一覧・記録と報告文・証拠の画像 |
+| `POST /v1/incidents/{id}/report` `…/rollback` `…/dismiss` | 通報 (1 事件に 1 回) / ロールバック (裏で始まる 202) / 却下 |
+| `POST /v1/players/{name}/mute` `…/kick` | ミュート (`CHAT_MUTE_CMD`) / キック |
+| `GET /v1/players/{name}/activity` `GET /v1/chat` | 最近のブロックの変更・コマンド・発言 |
+| `POST /v1/screenshot` `GET /v1/screenshots/{job}` | 指定した場所の BlueMap の撮影を始める (202 と job) / 撮れた画像 (まだなら 202)。撮るのに 1 分ほどかかり、Muse の 1 回の呼び出しは 45 秒で切れるので、2 回に分けている |
+| `GET /v1/discord/tools` `POST /v1/discord/call` | 許可した Discord のツールだけ (`CONTROL_DISCORD_ALLOW`。読むことと、投稿・タグ付け。BAN・キック・ロール・削除は含めない) |
+
+- 認証は、共有の秘密 (`CONTROL_TOKEN`、24 文字以上) の Bearer。**公開しない** (ports を付けない、トンネルに載せない)。
+- 頼んだ人は `X-Toro-User` に入り、操作 (GET 以外) はすべて `DATA_DIR/audit.jsonl` に 1 行ずつ残る。
+- 操作を受けるのは、`review` と `live` のときだけ。信頼する人と op には、ロールバック・ミュート・キックをしない。名前や ID は、英数字と `_ .` だけを通し、コンソールの命令にならないようにしている。
+- 画像・発言・Discord の本文は、利用者が書いた文字なので、TORO-MCP が「信頼できない入力」と注意を付けて返す (AI が、中の指示に従わないように)。
+- 事件の記録は `reports/<id>/record.json` (状態 `pending` / `reported` / `dismissed`、履歴、画像の名前)。
+
+Muse に定期的に見てもらう手順は [docs/MUSE.md](docs/MUSE.md)。
 
 ## 検知
 
@@ -131,7 +158,9 @@ toro-main には RCON も shell も無い (`enable-rcon=false`) ので、Docker 
 
 | 名前 | 既定 | 意味 |
 | --- | --- | --- |
-| `GUARD_MODE` | `observe` | `observe` / `dry-run` / `live` |
+| `GUARD_MODE` | `observe` | `observe` / `dry-run` / `review` / `live` |
+| `CONTROL_TOKEN` `CONTROL_ADDR` | (空 = 窓口を開かない) `:8090` | 操作の窓口の共有の秘密 (24 文字以上) と、待ち受け |
+| `CONTROL_DISCORD_ALLOW` | 読む・投稿・タグ付けだけ | 窓口から呼んでよい Discord のツール名の正規表現 |
 | `DB_HOST` `DB_PORT` `DB_USER` `DB_PASSWORD` `DB_NAME` `DB_TABLE_PREFIX` | `tidb` `4000` `root` (空) `coreprotect` `coreprotect_` | CoreProtect のデータベース (読むだけ) |
 | `BURST_WINDOW` `BREAK_BURST` `PLACE_BURST` `SUSTAINED_WINDOW` `SUSTAINED_BREAKS` | 5s 100 150 10m 1500 | 検知の閾値 |
 | `QUIET` `MAX_INCIDENT` | 90s / 10m | 動きが止まって何秒で閉じるか / 長くても何分で閉じるか |
@@ -171,7 +200,8 @@ toro-guard replay -user NAME -from 2026-11-04T10:50:00+09:00 -to 2026-11-04T11:0
 3. `GUARD_MODE=observe` で起動。`docker exec toro-guard /toro-guard check -console` (つながるか)。
 4. 数日見て、検知の記録 (`docker logs toro-guard`) に誤検知が無いか確かめる。
 5. `dry-run` にして、`/data/reports/` の画像と `report.md` を確かめる。
-6. `live` にする (KICK を使うかも、ここで決める)。
+6. `review` にして `CONTROL_TOKEN` を設定し、TORO-MCP に `GUARD_CONTROL_TOKEN` を渡す。Muse をつなぐ ([docs/MUSE.md](docs/MUSE.md))。人が見て決める運用で数件通す。
+7. 自動でロールバックまでしたければ `live` にする (KICK を使うかも、ここで決める)。
 
 ## 確かめたこと (2026-11-04、本番のデータベースを読むだけで)
 

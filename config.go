@@ -10,13 +10,19 @@ import (
 
 // Mode は動かし方。observe は検知して記録するだけ、dry-run は画像と報告文まで作って手元に置くだけ
 // (Discord には投稿せず、ロールバックもしない)、live は投稿とロールバックまで行う。
+// review は、画像と報告文を作って「確認待ち」に置き、人か AI (Muse など) が窓口 (control) から
+// 通報・ロールバック・却下を決める。自分では、投稿もロールバックもキックもしない。
 type Mode string
 
 const (
 	ModeObserve Mode = "observe"
 	ModeDryRun  Mode = "dry-run"
+	ModeReview  Mode = "review"
 	ModeLive    Mode = "live"
 )
+
+// CanAct は、窓口 (control) からの操作 (通報・ロールバック・ミュート・キック) を受け付ける動かし方か。
+func (m Mode) CanAct() bool { return m == ModeReview || m == ModeLive }
 
 type Config struct {
 	Mode Mode
@@ -86,6 +92,12 @@ type Config struct {
 	ShotHeight     int
 	ShotSettle     time.Duration
 
+	// 操作の窓口 (TORO-MCP が、Admin 以上の人の頼みを取り次ぐ)。内部のネットワークだけに出す。
+	// ControlToken が空なら窓口は開かない
+	ControlAddr  string
+	ControlToken string
+	DiscordAllow string // 窓口から呼んでよい Discord のツール名の正規表現
+
 	WarpsDir string
 	DataDir  string
 }
@@ -144,13 +156,19 @@ func loadConfig() (*Config, error) {
 		ShotWidth:        envInt("SHOT_WIDTH", 1280),
 		ShotHeight:       envInt("SHOT_HEIGHT", 720),
 		ShotSettle:       envDur("SHOT_SETTLE", 60*time.Second),
+		ControlAddr:      envStr("CONTROL_ADDR", ":8090"),
+		ControlToken:     strings.TrimSpace(os.Getenv("CONTROL_TOKEN")),
+		DiscordAllow:     envStr("CONTROL_DISCORD_ALLOW", defaultDiscordAllow),
 		WarpsDir:         os.Getenv("WARPS_DIR"),
 		DataDir:          envStr("DATA_DIR", "/data"),
 	}
 	switch c.Mode {
-	case ModeObserve, ModeDryRun, ModeLive:
+	case ModeObserve, ModeDryRun, ModeReview, ModeLive:
 	default:
-		return nil, fmt.Errorf("GUARD_MODE must be observe, dry-run or live: %q", c.Mode)
+		return nil, fmt.Errorf("GUARD_MODE must be observe, dry-run, review or live: %q", c.Mode)
+	}
+	if c.ControlToken != "" && len(c.ControlToken) < 24 {
+		return nil, fmt.Errorf("CONTROL_TOKEN must be at least 24 characters")
 	}
 	return c, nil
 }
