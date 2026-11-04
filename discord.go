@@ -2,12 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
-	"github.com/bwmarrin/discordgo"
 	"gopkg.in/yaml.v3"
 )
 
@@ -31,38 +31,57 @@ func LoadBotToken(path string) (string, error) {
 	return t, nil
 }
 
-// Reporter は通報チャンネル (フォーラム) に投稿する。REST だけを使い、Gateway には接続しない
-// (DiscordSRV が同じトークンで Gateway につないでいるので、もう 1 本つながない)。
+// Reporter は通報チャンネル (フォーラム) に投稿する。Discord の REST は、Discord-MCP (MCP サーバー) の経由で呼ぶ。
+// Gateway には接続しない (DiscordSRV が同じトークンで Gateway につないでいるので、もう 1 本つながない)。
+// Discord-MCP は自分のトークンを持たなくてよい。DiscordSRV のトークンを、呼ぶたびに authOverride で渡す
+// (サーバー側で DISCORD_MCP_ALLOW_AUTH_OVERRIDE=true にしておく)。
 type Reporter struct {
-	s         *discordgo.Session
+	mcp       *MCP
+	auth      string // "Bot <token>"
 	channelID string
 	tagID     string
 }
 
-func NewReporter(token, channelID, rollbackTagID string) (*Reporter, error) {
-	s, err := discordgo.New("Bot " + token)
-	if err != nil {
-		return nil, err
-	}
-	s.Client.Timeout = 60 * time.Second
-	s.UserAgent = "DiscordBot (TORO-Guard, 1.0)"
-	return &Reporter{s: s, channelID: channelID, tagID: rollbackTagID}, nil
+func NewReporter(mcp *MCP, token, channelID, rollbackTagID string) *Reporter {
+	return &Reporter{mcp: mcp, auth: "Bot " + token, channelID: channelID, tagID: rollbackTagID}
 }
 
-// Check は投稿せずに、トークンとチャンネルが使えるか確かめる。
+// reporterFor は設定から、DiscordSRV のトークンと Discord-MCP を使う Reporter を作る。
+func reporterFor(cfg *Config) (*Reporter, error) {
+	tok, err := LoadBotToken(cfg.DiscordSRVConfig)
+	if err != nil {
+		return nil, fmt.Errorf("discordsrv token: %w", err)
+	}
+	return NewReporter(NewMCP(cfg.DiscordMCPURL, cfg.MCPProtocol, cfg.DiscordMCPLazy), tok, cfg.ReportChannelID, cfg.RollbackTagID), nil
+}
+
+// Check は投稿せずに、MCP とトークンとチャンネルが使えるか確かめる。
 func (r *Reporter) Check(ctx context.Context) (string, error) {
-	me, err := r.s.User("@me", discordgo.WithContext(ctx))
+	out, err := r.mcp.Discord(ctx, DiscordCall{Tool: "discord_get_my_user", Fields: "id,username", Auth: r.auth})
 	if err != nil {
 		return "", fmt.Errorf("users/@me: %w", err)
 	}
-	ch, err := r.s.Channel(r.channelID, discordgo.WithContext(ctx))
+	var me struct {
+		Username string `json:"username"`
+	}
+	if err := json.Unmarshal([]byte(out), &me); err != nil {
+		return "", fmt.Errorf("users/@me: bad response: %s", oneLine(out, 120))
+	}
+	out, err = r.mcp.Discord(ctx, DiscordCall{Tool: "discord_get_channel", PathParams: map[string]any{"channel_id": r.channelID}, Fields: "id,name,type", Auth: r.auth})
 	if err != nil {
 		return "", fmt.Errorf("channel %s: %w", r.channelID, err)
 	}
-	if ch.Type != discordgo.ChannelTypeGuildForum {
+	var ch struct {
+		Name string `json:"name"`
+		Type int    `json:"type"`
+	}
+	if err := json.Unmarshal([]byte(out), &ch); err != nil {
+		return "", fmt.Errorf("channel %s: bad response: %s", r.channelID, oneLine(out, 120))
+	}
+	if ch.Type != 15 { // GUILD_FORUM
 		return "", fmt.Errorf("channel %s is not a forum (type %d)", r.channelID, ch.Type)
 	}
-	return fmt.Sprintf("bot=%s channel=%s (forum)", me.Username, ch.Name), nil
+	return fmt.Sprintf("bot=%s channel=%s (forum) via MCP", me.Username, ch.Name), nil
 }
 
 type ReportFile struct {
@@ -70,46 +89,75 @@ type ReportFile struct {
 	Path string
 }
 
+// mcpFiles は画像を Base64 にして、MCP に渡す形にする (サーバーと同じディスクを共有しなくて済む)。
+func mcpFiles(files []ReportFile) ([]map[string]any, error) {
+	var out []map[string]any
+	for _, f := range files {
+		b, err := os.ReadFile(f.Path)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, map[string]any{"filename": f.Name, "contentType": "image/png", "contentBase64": base64.StdEncoding.EncodeToString(b)})
+	}
+	return out, nil
+}
+
+// parseID は、Discord の返事 (JSON) から id を取り出す。
+func parseID(s string) (string, error) {
+	var v struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(s), &v); err != nil || v.ID == "" {
+		return "", fmt.Errorf("no id in response: %s", oneLine(s, 120))
+	}
+	return v.ID, nil
+}
+
 // Post は新しい投稿を立てる。existing があれば、その投稿に書き足す。投稿の ID を返す。
 // rolledBack のときは、投稿に「ロルバ済」のタグを付ける。
 func (r *Reporter) Post(ctx context.Context, existing, title, content string, files []ReportFile, rolledBack bool) (string, error) {
-	var dfiles []*discordgo.File
-	var closers []*os.File
-	defer func() {
-		for _, f := range closers {
-			f.Close()
-		}
-	}()
-	for _, f := range files {
-		fh, err := os.Open(f.Path)
-		if err != nil {
-			return "", err
-		}
-		closers = append(closers, fh)
-		dfiles = append(dfiles, &discordgo.File{Name: f.Name, Reader: fh})
-	}
-	msg := &discordgo.MessageSend{Content: content, Files: dfiles}
 	var tags []string
 	if rolledBack && r.tagID != "" {
 		tags = append(tags, r.tagID)
 	}
+	return r.PostTags(ctx, existing, title, content, files, tags)
+}
+
+// PostTags は Post と同じで、付けるタグを (ID で) 指定する。
+func (r *Reporter) PostTags(ctx context.Context, existing, title, content string, files []ReportFile, tags []string) (string, error) {
+	mf, err := mcpFiles(files)
+	if err != nil {
+		return "", err
+	}
 
 	if existing != "" {
-		if _, err := r.s.ChannelMessageSendComplex(existing, msg, discordgo.WithContext(ctx)); err == nil {
+		_, err := r.mcp.Discord(ctx, DiscordCall{
+			Tool: "discord_create_message", PathParams: map[string]any{"channel_id": existing},
+			Body: map[string]any{"content": content}, Files: mf, Fields: "id", Auth: r.auth,
+		})
+		if err == nil {
 			if len(tags) > 0 {
-				_, _ = r.s.ChannelEdit(existing, &discordgo.ChannelEdit{AppliedTags: &tags}, discordgo.WithContext(ctx))
+				_, _ = r.mcp.Discord(ctx, DiscordCall{
+					Tool: "discord_update_channel", PathParams: map[string]any{"channel_id": existing},
+					Body: map[string]any{"applied_tags": tags}, Fields: "id", Auth: r.auth,
+				})
 			}
 			return existing, nil
 		}
 		// 投稿が消えている・書けないときは、新しく立てる
 	}
-	th, err := r.s.ForumThreadStartComplex(r.channelID, &discordgo.ThreadStart{
-		Name:                title,
-		AutoArchiveDuration: 10080,
-		AppliedTags:         tags,
-	}, msg, discordgo.WithContext(ctx))
+	out, err := r.mcp.Discord(ctx, DiscordCall{
+		Tool: "discord_create_thread", PathParams: map[string]any{"channel_id": r.channelID},
+		Body: map[string]any{
+			"name":                  title,
+			"auto_archive_duration": 10080,
+			"applied_tags":          tags,
+			"message":               map[string]any{"content": content},
+		},
+		Files: mf, Fields: "id", Auth: r.auth,
+	})
 	if err != nil {
 		return "", err
 	}
-	return th.ID, nil
+	return parseID(out)
 }

@@ -17,6 +17,8 @@ type Guard struct {
 	cfg      *Config
 	cp       *CP
 	det      *Detector
+	cdet     *ChatDetector
+	ai       *AI // キーが無ければ nil
 	store    *Store
 	ops      *Ops      // コンソール (observe では使わない。replay では nil)
 	shooter  *Shooter  // 画像 (observe では使わない)
@@ -31,7 +33,7 @@ type Guard struct {
 
 func NewGuard(cfg *Config, cp *CP, st *Store, ops *Ops, sh *Shooter, rep *Reporter, log *slog.Logger) *Guard {
 	return &Guard{
-		cfg: cfg, cp: cp, det: NewDetector(cfg), store: st, ops: ops, shooter: sh, reporter: rep,
+		cfg: cfg, cp: cp, det: NewDetector(cfg), cdet: NewChatDetector(cfg), ai: NewAI(cfg), store: st, ops: ops, shooter: sh, reporter: rep,
 		warps: LoadWarps(cfg.WarpsDir), log: log,
 		suppressed: map[int]int64{}, queue: make(chan *Incident, 16),
 	}
@@ -49,6 +51,16 @@ func (g *Guard) Run(ctx context.Context) error {
 		_ = g.store.Save()
 		g.mu.Unlock()
 		g.log.Info("起動: 今ある最後の行から見る", "cursor", n)
+	}
+	if g.cfg.ChatEnabled && g.store.S.ChatCur == 0 {
+		n, err := g.cp.MaxChatRowID(ctx)
+		if err != nil {
+			return fmt.Errorf("max chat rowid: %w", err)
+		}
+		g.mu.Lock()
+		g.store.S.ChatCur = n
+		_ = g.store.Save()
+		g.mu.Unlock()
 	}
 	// 前回の続きの事件は、またキューに入れる
 	g.mu.Lock()
@@ -93,10 +105,117 @@ func (g *Guard) step(ctx context.Context) error {
 			break
 		}
 	}
+	if g.cfg.ChatEnabled {
+		if err := g.stepChat(ctx); err != nil {
+			g.log.Error("チャットの見張りが失敗", "err", err)
+		}
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.closeIdle(time.Now().Unix())
 	return g.store.Save()
+}
+
+// stepChat は新しい発言を読んで、スパムを事件にする。
+func (g *Guard) stepChat(ctx context.Context) error {
+	for {
+		msgs, err := g.cp.PollChat(ctx, g.store.S.ChatCur, 5000)
+		if err != nil {
+			return err
+		}
+		now := time.Now().Unix()
+		flags := g.aiChat(ctx, msgs, now) // 通信があるので、ロックの外で
+		g.mu.Lock()
+		for _, m := range msgs {
+			g.store.S.ChatCur = m.RowID
+			if now-m.Time > int64(g.cfg.MaxEventAge.Seconds()) {
+				continue
+			}
+			g.onChat(ctx, m, flags[m.RowID])
+		}
+		g.mu.Unlock()
+		if len(msgs) < 5000 {
+			return nil
+		}
+	}
+}
+
+// maxAIChatBatch は、AI に 1 度に見せる発言の数の上限。
+const maxAIChatBatch = 40
+
+// aiChat は、新しい発言を AI に見せて、対応すべき発言 (rowid → 判定) を返す。AI を使わない・失敗したときは空。
+// 発言が多い (起動直後に溜まっていたときなど) ときは、新しいほうから maxAIChatBatch 件だけ見せる。
+func (g *Guard) aiChat(ctx context.Context, msgs []ChatMsg, now int64) map[int64]*ChatFlag {
+	if g.ai == nil || !g.cfg.AIChat {
+		return nil
+	}
+	var fresh []ChatMsg
+	for _, m := range msgs {
+		if now-m.Time <= int64(g.cfg.MaxEventAge.Seconds()) && strings.TrimSpace(m.Msg) != "" {
+			fresh = append(fresh, m)
+		}
+	}
+	if len(fresh) == 0 {
+		return nil
+	}
+	if len(fresh) > maxAIChatBatch {
+		fresh = fresh[len(fresh)-maxAIChatBatch:]
+	}
+	names := map[int]string{}
+	for _, m := range fresh {
+		if _, ok := names[m.User]; !ok {
+			if u, err := g.cp.User(ctx, m.User); err == nil {
+				names[m.User] = u.Name
+			}
+		}
+	}
+	list, err := g.ai.ReviewChat(ctx, fresh, names)
+	if err != nil {
+		g.log.Warn("AI のチャットの判定が取れない (決まりだけで見張る)", "err", err)
+		return nil
+	}
+	out := map[int64]*ChatFlag{}
+	for i := range list {
+		f := list[i]
+		if f.Confidence < g.cfg.AIMinConf {
+			continue
+		}
+		out[fresh[f.ID].RowID] = &f
+	}
+	return out
+}
+
+// onChat は g.mu を持って呼ぶ。flag は、AI がこの発言を対応すべきと判定したとき (無ければ nil)。
+func (g *Guard) onChat(ctx context.Context, m ChatMsg, flag *ChatFlag) {
+	key := chatKey(m.User)
+	if inc := g.store.S.Incidents[key]; inc != nil && m.Time > inc.Last {
+		inc.Last = m.Time
+	}
+	t := g.cdet.Feed(m)
+	if t == nil && flag != nil {
+		t = &ChatTrigger{User: m.User, Time: m.Time, Kind: "ai", Detail: fmt.Sprintf("%s (確からしさ %d%%) %s", flag.Category, flag.Confidence, flag.Summary)}
+	}
+	if t == nil || g.store.S.Incidents[key] != nil || m.Time < g.suppressed[-m.User] {
+		return
+	}
+	u, err := g.cp.User(ctx, m.User)
+	if err != nil {
+		g.log.Error("ユーザーが引けない", "user", m.User, "err", err)
+		return
+	}
+	lname := strings.ToLower(u.Name)
+	if g.cfg.TrustedPlayers[lname] || LoadOps(g.cfg.OpsFile)[lname] {
+		g.suppressed[-m.User] = m.Time + 3600 // チャットは、ブロックと別に数える (鍵を負の数にする)
+		g.log.Info("チャットのスパムを検知したが対象外", "player", u.Name, "trigger", t.String())
+		return
+	}
+	inc := &Incident{
+		ID:     fmt.Sprintf("chat-%s-%s", time.Unix(m.Time, 0).In(jst).Format("20060102-150405"), u.Name),
+		UserID: m.User, Name: u.Name, UUID: u.UUID, Kind: "chat",
+		Start: m.Time, Last: m.Time, Trigger: t.String(),
+	}
+	g.store.S.Incidents[key] = inc
+	g.log.Warn("チャットのスパムを検知", "player", u.Name, "trigger", t.String(), "incident", inc.ID, "mode", g.cfg.Mode)
 }
 
 // onEvent は g.mu を持って呼ぶ。
@@ -171,7 +290,11 @@ func (g *Guard) closeIdle(now int64) {
 		if inc.Queued {
 			continue
 		}
-		quiet := now-inc.Last >= int64(g.cfg.Quiet.Seconds())
+		quietFor := g.cfg.Quiet
+		if inc.Kind == "chat" {
+			quietFor = g.cfg.ChatQuiet
+		}
+		quiet := now-inc.Last >= int64(quietFor.Seconds())
 		long := now-inc.Start >= int64(g.cfg.MaxIncident.Seconds())
 		if !quiet && !long {
 			continue
@@ -193,10 +316,22 @@ func (g *Guard) worker(ctx context.Context) {
 		case inc := <-g.queue:
 			// 閉じる前に Reset (同じ人の続きは新しい事件として数え直す)
 			g.mu.Lock()
-			g.det.Reset(inc.UserID)
-			delete(g.store.S.Incidents, fmt.Sprint(inc.UserID))
+			if inc.Kind == "chat" {
+				g.cdet.Reset(inc.UserID)
+			} else {
+				g.det.Reset(inc.UserID)
+			}
+			delete(g.store.S.Incidents, inc.Key())
 			_ = g.store.Save()
 			g.mu.Unlock()
+			if inc.Kind == "chat" {
+				if res, err := g.ProcessChat(ctx, inc, time.Now().Unix()); err != nil {
+					g.log.Error("チャットの事件の処理に失敗", "incident", inc.ID, "err", err)
+				} else {
+					g.log.Info("チャットの事件を処理した", "incident", inc.ID, "dir", res.Dir, "posted", res.ThreadID != "", "muted", res.Muted)
+				}
+				continue
+			}
 			if res, err := g.Process(ctx, inc); err != nil {
 				g.log.Error("事件の処理に失敗", "incident", inc.ID, "err", err)
 			} else {
@@ -257,15 +392,44 @@ func (g *Guard) processWindow(ctx context.Context, inc *Incident, end int64) (*R
 
 	// 2. 被害の BlueMap の画面
 	cam := CamFor(stats)
-	damage := g.bluemapShot(ctx, mapID, stats, cam, filepath.Join(dir, "damage.png"))
+	damage := g.bluemapShot(ctx, mapID, stats, cam, filepath.Join(dir, "damage.png"),
+		AnnotFor(stats, fmt.Sprintf("%s  BROKEN %s blocks", stats.User.Name, comma(stats.Breaks)),
+			"red = broken columns / yellow = affected area", true), true)
+	// 範囲が広いときは、いちばん壊された所に寄った画面も撮る (地図の更新は、全体の分で済んでいる)
+	closeup := ""
+	if cc, ok := CloseCamFor(stats, cam); ok {
+		an := AnnotFor(stats, fmt.Sprintf("%s  CLOSE-UP (most broken spot)", stats.User.Name), "red = broken columns", true)
+		an.NoBox = true
+		closeup = g.bluemapShot(ctx, mapID, stats, cc, filepath.Join(dir, "closeup.png"), an, false)
+	}
 
-	// 3. ロールバック (live だけ)
+	// 3. AI の確認 → ロールバック (live だけ)
 	out := Outcome{}
 	seconds := int(now-inc.Start) + 5
 	out.Cmd = RollbackCmd(inc.Name, seconds, stats.World)
 	out.RestoreCmd = RestoreCmd(inc.Name, seconds, stats.World)
+	if g.ai != nil {
+		v, err := g.ai.ReviewIncident(ctx, stats, inc.Trigger, []string{damage, closeup})
+		if err != nil {
+			g.log.Warn("AI の判定が取れない", "err", err)
+			out.AIError = err.Error()
+		} else {
+			out.AI = v
+			g.log.Info("AI の判定", "incident", inc.ID, "verdict", v.Verdict, "confidence", v.Confidence, "summary", v.Summary)
+		}
+	}
+	// AI が「荒らしではない」「確信が低い」と答えたら、ロールバックしない (通報はして、運営が見る)。
+	// AI が使えないときは、AI_REQUIRED=true でなければ、閾値の決まりだけで進める
+	switch {
+	case g.ai != nil && out.AI != nil && !out.AI.Allows(g.cfg.AIMinConf):
+		out.Skipped = fmt.Sprintf("AI の判定が「%s」(確からしさ %d%%) で、基準 %d%% の「荒らし」に届かない", verdictJP(out.AI.Verdict), out.AI.Confidence, g.cfg.AIMinConf)
+	case g.cfg.AIRequired && out.AI == nil:
+		out.Skipped = "AI の判定が得られない (AI_REQUIRED=true)"
+	}
 	restored := ""
 	switch {
+	case out.Skipped != "":
+		// ロールバックしない
 	case g.cfg.Mode == ModeLive && g.ops != nil:
 		lines, err := g.ops.Rollback(ctx, inc.Name, seconds, stats.World)
 		out.Lines = lines
@@ -280,7 +444,8 @@ func (g *Guard) processWindow(ctx context.Context, inc *Incident, end int64) (*R
 			out.Error = err.Error()
 		}
 		if out.RolledBack {
-			restored = g.bluemapShot(ctx, mapID, stats, cam, filepath.Join(dir, "restored.png"))
+			restored = g.bluemapShot(ctx, mapID, stats, cam, filepath.Join(dir, "restored.png"),
+				AnnotFor(stats, fmt.Sprintf("%s  RESTORED (rollback done)", stats.User.Name), "yellow = affected area", false), true)
 		}
 	default:
 		out.Planned = true
@@ -290,17 +455,18 @@ func (g *Guard) processWindow(ctx context.Context, inc *Incident, end int64) (*R
 	// 4. 報告文と画像
 	var files []ReportFile
 	var desc []string
-	if damage != "" {
-		files = append(files, ReportFile{Name: "damage.png", Path: damage})
-		desc = append(desc, "1枚目 被害 (BlueMap)")
+	add := func(name, path, what string) {
+		if path == "" {
+			return
+		}
+		files = append(files, ReportFile{Name: name, Path: path})
+		desc = append(desc, fmt.Sprintf("%d枚目 %s", len(files), what))
 	}
-	if restored != "" {
-		files = append(files, ReportFile{Name: "restored.png", Path: restored})
-		desc = append(desc, fmt.Sprintf("%d枚目 ロールバック後 (BlueMap)", len(files)))
-	}
-	if len(files) < 2 && heat != "" {
-		files = append(files, ReportFile{Name: "heatmap.png", Path: heat})
-		desc = append(desc, fmt.Sprintf("%d枚目 壊した場所 (真上から)", len(files)))
+	add("damage.png", damage, "被害の全体 (赤い線 = 壊された列)")
+	add("closeup.png", closeup, "いちばん壊された所")
+	add("restored.png", restored, "ロールバック後")
+	if len(files) < 2 {
+		add("heatmap.png", heat, "壊した場所 (真上から)")
 	}
 	res.Images = files
 
@@ -337,11 +503,12 @@ func (g *Guard) processWindow(ctx context.Context, inc *Incident, end int64) (*R
 }
 
 // bluemapShot は、書き出し → BlueMap の更新 → 待つ → 撮る。失敗しても事件の処理は続ける (空の文字列を返す)。
-func (g *Guard) bluemapShot(ctx context.Context, mapID string, s *Stats, cam Cam, out string) string {
+// refresh が false のときは、書き出しと更新を飛ばして、いまの地図で撮る (同じ事件の 2 枚目以降)。
+func (g *Guard) bluemapShot(ctx context.Context, mapID string, s *Stats, cam Cam, out string, ann *Annot, refresh bool) string {
 	if g.shooter == nil || mapID == "" {
 		return ""
 	}
-	if g.ops != nil {
+	if g.ops != nil && refresh {
 		cx, cz := (s.X0+s.X1)/2, (s.Z0+s.Z1)/2
 		radius := maxInt(maxInt(s.X1-s.X0, s.Z1-s.Z0)/2+48, 64)
 		if err := g.ops.SaveFlush(ctx); err != nil {
@@ -353,9 +520,12 @@ func (g *Guard) bluemapShot(ctx context.Context, mapID string, s *Stats, cam Cam
 			g.log.Warn("BlueMap の更新を待ちきれない (古い地図で撮る)", "err", err)
 		}
 	}
-	if err := g.shooter.Shot(ctx, mapID, cam, out); err != nil {
+	if err := g.shooter.Shot(ctx, mapID, cam, out, ann); err != nil {
 		g.log.Warn("BlueMap の画面が撮れない", "err", err)
 		return ""
+	}
+	if ann != nil && !strings.HasPrefix(g.shooter.LastOverlay, "ok:") {
+		g.log.Warn("画面に印を重ねられなかった (印の無い画面を使う)", "result", g.shooter.LastOverlay)
 	}
 	return out
 }

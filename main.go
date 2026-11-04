@@ -36,6 +36,8 @@ func main() {
 		err = cmdReplay(log, os.Args[2:])
 	case "scan":
 		err = cmdScan(log, os.Args[2:])
+	case "scan-chat":
+		err = cmdScanChat(os.Args[2:])
 	case "healthcheck":
 		err = cmdHealth()
 	case "version":
@@ -78,11 +80,7 @@ func cmdRun(log *slog.Logger) error {
 		sh = NewShooter(cfg)
 	}
 	if cfg.Mode == ModeLive {
-		tok, err := LoadBotToken(cfg.DiscordSRVConfig)
-		if err != nil {
-			return fmt.Errorf("discordsrv token: %w", err)
-		}
-		rep, err = NewReporter(tok, cfg.ReportChannelID, cfg.RollbackTagID)
+		rep, err = reporterFor(cfg)
 		if err != nil {
 			return err
 		}
@@ -127,11 +125,7 @@ func cmdCheck(log *slog.Logger, args []string) error {
 	}
 	fmt.Printf("database: ok (%s:%s/%s, 最後の行 %d)\n", cfg.DBHost, cfg.DBPort, cfg.DBName, n)
 
-	tok, err := LoadBotToken(cfg.DiscordSRVConfig)
-	if err != nil {
-		return fmt.Errorf("discordsrv token: %w", err)
-	}
-	rep, err := NewReporter(tok, cfg.ReportChannelID, cfg.RollbackTagID)
+	rep, err := reporterFor(cfg)
 	if err != nil {
 		return err
 	}
@@ -140,6 +134,16 @@ func cmdCheck(log *slog.Logger, args []string) error {
 		return fmt.Errorf("discord: %w", err)
 	}
 	fmt.Println("discord: ok (" + info + ")  ※何も投稿していません")
+
+	if ai := NewAI(cfg); ai == nil {
+		fmt.Println("ai: 使わない (AI_API_KEY が無い)。ロールバックは、閾値の決まりだけで決まる")
+	} else {
+		// 無害な 1 件の発言を見せて、答えが JSON で返ってくるかだけ確かめる
+		if _, err := ai.ReviewChat(ctx, []ChatMsg{{Time: time.Now().Unix(), User: 1, Msg: "こんにちは"}}, map[int]string{1: "test"}); err != nil {
+			return fmt.Errorf("ai: %w", err)
+		}
+		fmt.Printf("ai: ok (%s)\n", cfg.AIModel)
+	}
 
 	if *console {
 		ops := Ops{C: &DockerConsole{Socket: cfg.DockerSocket, Container: cfg.MCContainer}}

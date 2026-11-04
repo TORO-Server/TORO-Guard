@@ -3,6 +3,35 @@
 #
 #   toro-guard-data/ を作って、65532 が書けるようにする:  mkdir toro-guard-data && sudo chown 65532:65532 toro-guard-data
 #   DOCKER_GID は、ホストの docker グループの番号:        getent group docker | cut -d: -f3
+  # Discord への投稿は、Discord-MCP (かふぇほらいずん公式のイメージ) の経由で行う。
+  # トークンはここに置かない: toro-guard が DiscordSRV の BotToken を、呼ぶたびに authOverride で渡す。
+  # DISCORD_BOT_TOKEN は起動に要るだけの印 (使わない)。外には公開せず (ports なし)、必要なツールだけ登録する。
+  discord-mcp:
+    image: ghcr.io/cafe-horizon/discord-mcp:latest
+    container_name: discord-mcp
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - DISCORD_BOT_TOKEN=unused
+      - MCP_TRANSPORT=http
+      - MCP_HTTP_PORT=8080
+      - MCP_ALLOWED_HOSTS=discord-mcp:8080
+      - DISCORD_MCP_LAZY_TOOLS=true
+      - DISCORD_MCP_ALLOW_AUTH_OVERRIDE=true
+      - DISCORD_MCP_ENABLE_GATEWAY=false
+      - DISCORD_MCP_ALLOW_FILE_PATH=false
+      - DISCORD_MCP_ALLOW_FILE_URL=false
+      # 通報に要る操作 (自分の確認・チャンネルの確認・投稿を立てる・書き足す・タグを付ける) だけ
+      - DISCORD_MCP_INCLUDE_TOOLS=^discord_(call_tool|search_tools|get_my_user|get_channel|create_thread|create_message|update_channel)$$
+    networks:
+      - minecraft-network
+
   toro-guard:
     image: ghcr.io/toro-server/toro-guard:latest
     container_name: toro-guard
@@ -21,18 +50,24 @@
       - no-new-privileges:true
     depends_on:
       - tidb
+      - discord-mcp
     environment:
       - TZ=Asia/Tokyo
       - GUARD_MODE=observe
       - DB_HOST=tidb
       - DB_PASSWORD=${NUXT_DB_PASSWORD:-}
-      # 通報先は、荒らし通報フォーラム。トークンは DiscordSRV の config.yml (BotToken) を読む
+      # 通報先は、荒らし通報フォーラム。トークンは DiscordSRV の config.yml (BotToken) を読み、Discord-MCP に渡す
+      - DISCORD_MCP_URL=http://discord-mcp:8080/mcp
       - REPORT_CHANNEL_ID=1000000000000000001
       - ROLLBACK_TAG_ID=1000000000000000002
       # BlueMap は、外に出ずに toro-edge から読む (Host は 3d-map.torosaba.net のまま)
       - BLUEMAP_URL=http://3d-map.torosaba.net
       - BLUEMAP_RESOLVE=toro-edge:80
       - MAP_IDS=main=overworld
+      # AI (Claude) の確認。キーを渡したときだけ使う (荒らしの確認と、チャットの暴言)。キーは .env に置き、リポジトリには置かない
+      - AI_API_KEY=${TORO_GUARD_AI_KEY:-}
+      # チャットのスパムを見つけたら「mute {name} 10m spam」を送る (使うミュートのプラグインに合わせる。空なら、ミュートはしない)
+      - CHAT_MUTE_CMD=
       # 報告に「ワープ ○○ の近く」と書く
       - WARPS_DIR=/warps
       # 検知の対象にしない人 (名前をコンマで区切る)。道具を使う人は、コマンドで自動でも外れる

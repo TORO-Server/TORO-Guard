@@ -19,6 +19,19 @@ type Outcome struct {
 	Lines       []string
 	Error       string
 	Kicked      bool
+	AI          *Verdict // AI の判定 (使わないときは nil)
+	AIError     string
+	Skipped     string // ロールバックをしなかった理由
+}
+
+func verdictJP(v string) string {
+	switch v {
+	case "grief":
+		return "荒らし"
+	case "legit":
+		return "正当な作業"
+	}
+	return "判断できない"
 }
 
 // ReportInput は報告文の材料。
@@ -46,9 +59,6 @@ func BuildReport(in ReportInput) string {
 	}
 	fmt.Fprintf(&b, "**ワールド**: %s\n", orDash(s.World))
 	fmt.Fprintf(&b, "**荒らしプレイヤー**: %s (`%s`)\n", s.User.Name, s.User.UUID)
-	if in.Center != nil {
-		fmt.Fprintf(&b, "**座標**: %.0f %.0f 付近 (x z)\n", in.Center.X, in.Center.Z)
-	}
 	if in.Center != nil {
 		fmt.Fprintf(&b, "**座標**: %.0f %.0f 付近 (x z)\n", in.Center.X, in.Center.Z)
 	}
@@ -83,7 +93,12 @@ func BuildReport(in ReportInput) string {
 	}
 	fmt.Fprintf(&b, "**検知**: %s\n", in.Trigger)
 
+	if in.Out.AI != nil {
+		fmt.Fprintf(&b, "**AI の判定**: %s (確からしさ %d%%) %s\n", verdictJP(in.Out.AI.Verdict), in.Out.AI.Confidence, in.Out.AI.Summary)
+	}
 	switch {
+	case in.Out.Skipped != "":
+		fmt.Fprintf(&b, "**対応**: 自動ロールバックはしていません (%s)。運営が確認してください。ロールバックするときは `%s`\n", in.Out.Skipped, in.Out.Cmd)
 	case in.Out.RolledBack:
 		fmt.Fprintf(&b, "**対応**: CoreProtect で自動ロールバック済み (%s / %s 件)\n", comma(in.Out.RolledDone), comma(in.Out.RolledTotal))
 	case in.Out.Planned:

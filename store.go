@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,7 +19,18 @@ type Incident struct {
 	Last    int64  `json:"last"`
 	Trigger string `json:"trigger"`
 	Queued  bool   `json:"queued,omitempty"`
+	Kind    string `json:"kind,omitempty"` // "" はブロックの荒らし、"chat" はチャットのスパム
 }
+
+// Key は Incidents の鍵。同じ人でも、ブロックの荒らしとチャットのスパムは別の事件にする。
+func (i *Incident) Key() string {
+	if i.Kind == "chat" {
+		return chatKey(i.UserID)
+	}
+	return fmt.Sprint(i.UserID)
+}
+
+func chatKey(user int) string { return fmt.Sprintf("chat:%d", user) }
 
 // ThreadRef は、その人について立てたフォーラムの投稿。同じ人の続きは、新しく立てずにこの投稿に書き足す。
 type ThreadRef struct {
@@ -28,6 +40,7 @@ type ThreadRef struct {
 
 type State struct {
 	Cursor    int64                `json:"cursor"`
+	ChatCur   int64                `json:"chat_cursor"`
 	Incidents map[string]*Incident `json:"incidents"` // key: user id
 	Threads   map[string]ThreadRef `json:"threads"`   // key: 小文字の名前
 }

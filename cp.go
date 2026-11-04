@@ -225,6 +225,7 @@ type MatCount struct {
 
 type Column struct {
 	X, Z, N int
+	Y0, Y1  int // 壊した高さの最低と最高
 }
 
 // Stats は 1 人の [from, to] のブロックの変更のまとめ。
@@ -322,13 +323,13 @@ func (c *CP) Stats(ctx context.Context, user UserInfo, from, to int64) (*Stats, 
 	mrows.Close()
 
 	crows, err := c.db.QueryContext(ctx,
-		"SELECT x, z, COUNT(*) FROM "+c.p+"block WHERE user = ? AND time BETWEEN ? AND ? AND wid = ? AND action = 0 GROUP BY x, z LIMIT 300000", user.ID, from, to, s.Wid)
+		"SELECT x, z, COUNT(*), MIN(y), MAX(y) FROM "+c.p+"block WHERE user = ? AND time BETWEEN ? AND ? AND wid = ? AND action = 0 GROUP BY x, z LIMIT 300000", user.ID, from, to, s.Wid)
 	if err != nil {
 		return nil, err
 	}
 	for crows.Next() {
 		var col Column
-		if err := crows.Scan(&col.X, &col.Z, &col.N); err != nil {
+		if err := crows.Scan(&col.X, &col.Z, &col.N, &col.Y0, &col.Y1); err != nil {
 			crows.Close()
 			return nil, err
 		}

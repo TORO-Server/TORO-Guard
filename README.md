@@ -62,7 +62,8 @@ CoreProtect (TiDB) ── 3 秒ごとに新しい行 ──▶ 検知 (人の手
 通報先は、フォーラム「荒らし通報」(`1000000000000000001`)。このフォーラムの決まり (トピック: ワールド名・荒らしプレイヤーの名前・証拠画像 5 ブロック以上・画像 1〜2 枚) に合わせる。
 
 - 投稿の名前は、荒らしの名前。本文に、ワールド、名前と UUID、座標、範囲、時間、数、主な破壊、使ったコマンド、対応を書く。
-- 画像は 2 枚まで: 被害 → 復旧後 (BlueMap)。撮れなかったときは、真上の図で埋める。
+- 画像: 被害の全体 → (範囲が広いときは) いちばん壊された所に寄った画面 → (ロールバックできたら) 復旧後。BlueMap が撮れなかったときは、真上の図で埋める。
+- BlueMap は「いまの地形」だけを描くので、穴や欠けだけでは、どこが荒らされたか分からない。そこで、撮った画面の上に印を重ねる: 壊された列を**赤い縦線**、主な範囲 (壊した数の 97%) を**黄色の枠**、左上に名前と壊した数。復旧後の画面は、同じカメラで、赤い線なしで撮る (前後を比べられる)。印の文字は ASCII だけ (実行する環境に日本語のフォントが無いため)。
 - ロールバックできたら、タグ「ロルバ済」を付ける。
 - 同じ人は 24 時間以内なら、新しく立てず、同じ投稿に書き足す。
 - このフォーラムでは、ボットに「埋め込みのリンク」の権限が無いので、embed は使わず、普通の文字だけで書く。
@@ -72,6 +73,41 @@ CoreProtect (TiDB) ── 3 秒ごとに新しい行 ──▶ 検知 (人の手
 
 ボットのトークンは、DiscordSRV の `plugins/DiscordSRV/config.yml` の `BotToken` を、読み取り専用でマウントして読む。トークンを `.env` やリポジトリに写さない。
 REST だけを使い、Gateway には接続しない (DiscordSRV が同じトークンで接続しているので、もう 1 本つながない)。
+
+### Discord MCP の経由で投稿する
+
+Discord への投稿は、**Discord-MCP** (かふぇほらいずん公式のイメージ `ghcr.io/cafe-horizon/discord-mcp`) の MCP の経由で行う (`mcp.go`)。toro-guard は MCP のクライアントで、ステートレスな Streamable HTTP (`/mcp`) に `tools/call` を 1 回ずつ送る。
+
+- サーバーは `compose.example.yaml` の `discord-mcp`。外には公開せず (ports なし)、`DISCORD_MCP_LAZY_TOOLS=true`、Gateway なし、`filePath`/`url` の添付なし、通報に要るツールだけ (`DISCORD_MCP_INCLUDE_TOOLS`)。
+- サーバーにはトークンを置かない (`DISCORD_BOT_TOKEN=unused`)。toro-guard が DiscordSRV の BotToken を、呼ぶたびに `authOverride` (`Bot <token>`) で渡す。サーバーに `DISCORD_MCP_ALLOW_AUTH_OVERRIDE=true` が要る。
+- 画像は Base64 (`files[].contentBase64`) で渡す (サーバーとディスクを共有しない)。
+- 使うツール: `discord_get_my_user`、`discord_get_channel` (確認)、`discord_create_thread` (投稿を立てる)、`discord_create_message` (書き足す)、`discord_update_channel` (タグ)。
+- 実際のイメージ (2025-11-25 の MCP の版) に、`tools/call` を送って、応答の形と `authOverride` が使えること (既定は「無効」と答える) を確かめた。
+
+## AI (Claude) の確認
+
+`AI_API_KEY` (または `ANTHROPIC_API_KEY`) を渡すと、Claude の Messages API (`AI_MODEL`、既定 `claude-haiku-5-5`) が、2 つの役をする。キーが無ければ使わない (これまでと同じ)。
+
+1. **荒らしの確認 (ロールバックの前)**: 集計 (数・範囲・主な破壊・コマンド・コンテナ) と、画面 (赤い線つき) を見て、`荒らし` / `正当な作業` / `判断できない` と、確からしさ (0〜100) と一言を答える。`荒らし` で、`AI_MIN_CONFIDENCE` (既定 70) 以上のときだけ、ロールバックする。そうでないときは、ロールバックせず、通報だけして「運営が確認してください」と書く。AI が使えない (エラー) ときは、既定では閾値の決まりだけで進める。`AI_REQUIRED=true` なら、AI が「荒らし」と言うまでロールバックしない。
+2. **チャットの見張り**: 新しい発言を (最大 40 件ずつ) 見せて、暴言・性的な発言・差別・勧誘・スパムを選ぶ。回数の決まりでは見つからない発言を、通報にする。`AI_CHAT=false` で止められる。
+
+安全の考え方: プレイヤーの名前・発言・コマンドは、AI には「データ」として渡し、命令には従わないように指示する。AI の答えが影響するのは「ロールバックを止める」と「通報する」方向だけで、AI の答えだけでロールバックやミュートが**増えることは無い** (ロールバックは、閾値を超えた事件にだけ行う)。AI の答えの文章は、改行を除き、`@` を無効にして、長さを切ってから、報告に載せる。
+
+> **送信されるもの**: 事件の集計と画面 (BlueMap の地図の画像)、チャットの発言 (名前つき) が、Anthropic の API に送られる。
+
+## チャットのスパム
+
+CoreProtect の `chat` の表 (`rowid, time, user, message`) を、ブロックと別のカーソルで見る。
+
+- 連投: `CHAT_RATE` (既定 12) 件 / `CHAT_RATE_WINDOW` (10s)。カウントダウン「5 4 3 2 1 0 go」(8 件 / 10 秒) は、実際にあったので、誤検知しない値にした。
+- 同じ発言: `CHAT_REPEAT` (5) 回 / `CHAT_REPEAT_WINDOW` (60s)。数字・記号・空白を除いて比べる (「買ってね 1」「買ってね 2」は同じ)。
+- 同じ文字が `CHAT_RUN` (30) 個以上つづく発言。
+- Discord の招待リンクを 5 分に 2 回、リンクつきの発言を `CHAT_LINK_REPEAT` (3) 回 / 5 分。
+- 禁止語: `CHAT_BAD_WORDS_FILE` (1 行に 1 語、既定は使わない)。暴言・性的な発言は、回数では見つからないので、AI の確認 (上) か、この一覧で。
+- 発言が止まって `CHAT_QUIET` (30s) たったら、報告する (発言の抜粋 12 行まで。`@` は無効にする)。報告は、ブロックの荒らしと同じフォーラムの、同じ人の投稿に書き足す。
+- ミュートは `CHAT_MUTE_CMD` (例 `mute {name} 10m spam`) を設定したときだけ、`live` で行う。名前は Minecraft の名前の形 (英数字と `_` `.`、32 字まで) のときだけ使う (コマンドの注入を避ける)。付けるタグは `CHAT_MUTE_TAG_ID`。
+- op と `TRUSTED_PLAYERS` は、対象外。
+- 過去の記録で、誤検知を見積もる: `toro-guard scan-chat -days 365`。
 
 > 2026-11-04 に確かめた: このボット (`TORO chat`) は、通報フォーラムを見られて、投稿・画像の添付ができる。「埋め込みのリンク」だけができない。
 
@@ -103,6 +139,11 @@ toro-main には RCON も shell も無い (`enable-rcon=false`) ので、Docker 
 | `TRUSTED_PLAYERS` `OPS_FILE` | (空) (空) | 検知しない人 (コンマ区切り) / op の一覧 (`ops.json`)。op も検知しない |
 | `MAX_EVENT_AGE` | 15m | これより古い行は、見ても報告しない (止まっていたあいだのもの) |
 | `DISCORDSRV_CONFIG` | `/discordsrv/config.yml` | DiscordSRV の設定 (BotToken を読む) |
+| `DISCORD_MCP_URL` `DISCORD_MCP_LAZY` `MCP_PROTOCOL_VERSION` | `http://discord-mcp:8085/mcp` `true` `2025-11-25` | Discord-MCP の場所 / `discord_call_tool` 1 本にまとめているか / MCP の版 |
+| `AI_API_KEY` (`ANTHROPIC_API_KEY`) `AI_MODEL` `AI_BASE_URL` | (空 = AI を使わない) `claude-haiku-5-5` `https://api.anthropic.com` | AI の確認 |
+| `AI_MIN_CONFIDENCE` `AI_REQUIRED` `AI_CHAT` | 70 `false` `true` | AI の判定を採る確からしさ / AI が「荒らし」と言わないとロールバックしない / チャットも AI に見せる |
+| `CHAT_ENABLED` `CHAT_RATE` `CHAT_RATE_WINDOW` `CHAT_REPEAT` `CHAT_REPEAT_WINDOW` `CHAT_RUN` `CHAT_LINK_REPEAT` `CHAT_QUIET` | `true` 12 10s 5 60s 30 3 30s | チャットのスパムの閾値 |
+| `CHAT_BAD_WORDS_FILE` `CHAT_MUTE_CMD` `CHAT_MUTE_TAG_ID` | (空) (空) (空) | 禁止語の一覧 / ミュートのコマンド (`{name}`) / ミュートしたときのタグ |
 | `REPORT_CHANNEL_ID` `ROLLBACK_TAG_ID` | 通報フォーラム / 「ロルバ済」 | 通報先 |
 | `DOCKER_SOCKET` `MC_CONTAINER` | `/var/run/docker.sock` `toro-main` | コンソールの入り口 |
 | `KICK_ENABLED` | `false` | `live` で、検知したらすぐキックする |
@@ -118,6 +159,7 @@ toro-main には RCON も shell も無い (`enable-rcon=false`) ので、Docker 
 toro-guard run                      # 見張りを続ける
 toro-guard check [-console]         # データベース・Discord のトークンとチャンネルを確かめる (何も投稿しない)
 toro-guard scan -days 30            # 過去の記録に、いまの閾値を当てはめて、誤検知を見積もる (何も書かない)
+toro-guard scan-chat -days 365      # 同じことを、チャットで
 toro-guard replay -user NAME -from 2026-11-04T10:50:00+09:00 -to 2026-11-04T11:00:00+09:00 -out DIR
                                     # 過去の 1 件に当てはめ、画像と報告文を DIR に作る (投稿もロールバックもしない)
 ```
@@ -139,7 +181,11 @@ toro-guard replay -user NAME -from 2026-11-04T10:50:00+09:00 -to 2026-11-04T11:0
 - **Discord**: DiscordSRV のトークンで、通報フォーラムが見えることを確かめた (何も投稿していない)。
 - 単体の試験 (`go test -race`): 検知、コンソールの読み取り、報告文、状態の保存など。
 
-**まだ確かめていないこと**: 実際のロールバックのコマンドの返事 (CoreProtect の文言)、`bluemap update` を送ったあとの待ち、フォーラムへの投稿そのもの (タグ・画像の添付)、コンテナのイメージ (この手元に Docker が無く、ビルドしていない)。`dry-run` と最初の `live` で確かめる。
+- **画面の印** (2026-11-04、再現): fuuty119 の記録で、赤い縦線が、壊された建物の部屋とピラミッドの上に載ることを目で確かめた (その後ロールバックされていたので、地図は復旧後の姿。印が、壊された場所を示す)。範囲が広いので、全体の画面と、寄った画面の 2 枚になる。
+- **チャット**: 過去 1 年 (10,227 件) に当てはめて、通報の対象は 3 件 (同じ文字 127 個の連続、同じ発言の連投 2 件)。カウントダウンの誤検知は閾値を直して消した。
+- **Discord-MCP**: 本物のサーバーに `tools/call` を送って、応答の形と、`authOverride` が「既定では無効」なことを確かめた。クライアントは、模擬のサーバーで試験した。
+
+**まだ確かめていないこと**: AI (Claude) の実際の API (キーが無く、模擬のサーバーでしか試験していない)、DiscordSRV のトークンでの MCP 経由の実際の投稿 (サーバーを本番に置いていない)、実際のロールバックのコマンドの返事 (CoreProtect の文言)、`bluemap update` を送ったあとの待ち、フォーラムへの投稿そのもの (タグ・画像の添付)、コンテナのイメージ (この手元に Docker が無く、ビルドしていない)。`dry-run` と最初の `live` で確かめる。
 
 ## 限界
 

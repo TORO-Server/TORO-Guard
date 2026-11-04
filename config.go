@@ -43,10 +43,34 @@ type Config struct {
 	PollInterval    time.Duration
 	MaxEventAge     time.Duration // これより古い行は、見ても報告しない (止まっていたあいだのもの)
 
+	// チャットのスパム (CoreProtect の chat の表)
+	ChatEnabled      bool
+	ChatRate         int           // この数以上の発言を
+	ChatRateWindow   time.Duration // この時間のうちにしたら (連投)
+	ChatRepeat       int           // 同じ (ほぼ同じ) 発言を、この数以上
+	ChatRepeatWindow time.Duration // この時間のうちにしたら (コピペの連投)
+	ChatRun          int           // 同じ文字がこの数以上つづく発言 (あああああ…)
+	ChatLinkRepeat   int           // リンクつきの発言を、この数以上 (5 分のうちに)
+	ChatBadWordsFile string        // 1 行に 1 語。発言に入っていたら、1 回で通報する (空なら使わない)
+	ChatQuiet        time.Duration // 発言が止まって、この時間たったら通報する
+	ChatMuteCmd      string        // 例: "mute {name} 10m spam"。空なら、ミュートはしない (live だけ)
+	ChatMuteTagID    string        // ミュートしたときに、投稿に付けるタグ (空なら付けない)
+
+	// AI (Claude の Messages API)。キーが無ければ、AI は使わない
+	AIKey      string
+	AIBaseURL  string
+	AIModel    string
+	AIMinConf  int  // この確からしさ (0〜100) 以上でないと、AI の判定を採らない
+	AIRequired bool // true なら、AI が「荒らし」と答えないかぎり、ロールバックしない (AI が使えないときも)
+	AIChat     bool // チャットの発言を AI にも見せる
+
 	// Discord
 	DiscordSRVConfig string
 	ReportChannelID  string
 	RollbackTagID    string
+	DiscordMCPURL    string // Discord-MCP (Streamable HTTP) の /mcp
+	DiscordMCPLazy   bool   // サーバーが DISCORD_MCP_LAZY_TOOLS=true (discord_call_tool 1 本) か
+	MCPProtocol      string // Mcp-Protocol-Version
 
 	// Minecraft のコンソール (docker attach)
 	DockerSocket string
@@ -87,9 +111,29 @@ func loadConfig() (*Config, error) {
 		OpsFile:          os.Getenv("OPS_FILE"),
 		PollInterval:     envDur("POLL_INTERVAL", 3*time.Second),
 		MaxEventAge:      envDur("MAX_EVENT_AGE", 15*time.Minute),
+		AIKey:            firstEnv("AI_API_KEY", "ANTHROPIC_API_KEY"),
+		AIBaseURL:        envStr("AI_BASE_URL", "https://api.anthropic.com"),
+		AIModel:          envStr("AI_MODEL", "claude-haiku-5-5"),
+		AIMinConf:        envInt("AI_MIN_CONFIDENCE", 70),
+		AIRequired:       envBool("AI_REQUIRED", false),
+		AIChat:           envBool("AI_CHAT", true),
+		ChatEnabled:      envBool("CHAT_ENABLED", true),
+		ChatRate:         envInt("CHAT_RATE", 12),
+		ChatRateWindow:   envDur("CHAT_RATE_WINDOW", 10*time.Second),
+		ChatRepeat:       envInt("CHAT_REPEAT", 5),
+		ChatRepeatWindow: envDur("CHAT_REPEAT_WINDOW", 60*time.Second),
+		ChatRun:          envInt("CHAT_RUN", 30),
+		ChatLinkRepeat:   envInt("CHAT_LINK_REPEAT", 3),
+		ChatBadWordsFile: os.Getenv("CHAT_BAD_WORDS_FILE"),
+		ChatQuiet:        envDur("CHAT_QUIET", 30*time.Second),
+		ChatMuteCmd:      os.Getenv("CHAT_MUTE_CMD"),
+		ChatMuteTagID:    os.Getenv("CHAT_MUTE_TAG_ID"),
 		DiscordSRVConfig: envStr("DISCORDSRV_CONFIG", "/discordsrv/config.yml"),
 		ReportChannelID:  envStr("REPORT_CHANNEL_ID", "1000000000000000001"),
 		RollbackTagID:    envStr("ROLLBACK_TAG_ID", "1000000000000000002"),
+		DiscordMCPURL:    envStr("DISCORD_MCP_URL", "http://discord-mcp:8085/mcp"),
+		DiscordMCPLazy:   envBool("DISCORD_MCP_LAZY", true),
+		MCPProtocol:      envStr("MCP_PROTOCOL_VERSION", "2025-11-25"),
 		DockerSocket:     envStr("DOCKER_SOCKET", "/var/run/docker.sock"),
 		MCContainer:      envStr("MC_CONTAINER", "toro-main"),
 		KickEnabled:      envBool("KICK_ENABLED", false),
@@ -109,6 +153,15 @@ func loadConfig() (*Config, error) {
 		return nil, fmt.Errorf("GUARD_MODE must be observe, dry-run or live: %q", c.Mode)
 	}
 	return c, nil
+}
+
+func firstEnv(keys ...string) string {
+	for _, k := range keys {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func envStr(k, d string) string {

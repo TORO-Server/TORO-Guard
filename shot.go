@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"net/url"
@@ -33,11 +34,85 @@ func CamFor(s *Stats) Cam {
 	span := math.Max(float64(s.X1-s.X0), float64(s.Z1-s.Z0))
 	if len(s.Columns) > 0 {
 		cx, cz = weightedMedian(s.Columns, func(c Column) int { return c.X }), weightedMedian(s.Columns, func(c Column) int { return c.Z })
-		span = 2 * weightedRadius(s.Columns, cx, cz, 0.6)
+		span = 2 * weightedRadius(s.Columns, cx, cz, 0.8) // 赤い印があるので、広めに撮っても、荒らされた所は見える
 	}
 	dist := math.Min(math.Max(span*1.1+40, 70), 600)
 	y := math.Min(math.Max(float64(s.Y0+s.Y1)/2, 62), 90)
 	return Cam{X: cx, Y: y, Z: cz, Dist: dist, Rot: -0.6, Angle: 0.75}
+}
+
+// CloseCamFor は、いちばん壊された所 (12 ブロック四方で壊した数が最大の区画) に寄ったカメラ。
+// 荒らされた範囲が広いと、全体の画面では 1 か所ずつが小さいので、寄った画面も足す。
+// 範囲が狭くて全体の画面と変わらないとき (全体の距離が近いとき) は、false。
+func CloseCamFor(s *Stats, overview Cam) (Cam, bool) {
+	if len(s.Columns) == 0 || overview.Dist < 130 {
+		return Cam{}, false
+	}
+	const cell = 12
+	type key struct{ a, b int }
+	type acc struct{ n, sx, sz, sy int }
+	cells := map[key]*acc{}
+	for _, c := range s.Columns {
+		k := key{floorDiv(c.X, cell), floorDiv(c.Z, cell)}
+		a := cells[k]
+		if a == nil {
+			a = &acc{}
+			cells[k] = a
+		}
+		a.n += c.N
+		a.sx += c.X * c.N
+		a.sz += c.Z * c.N
+		a.sy += c.Y1 * c.N
+	}
+	var best *acc
+	for _, a := range cells {
+		if best == nil || a.n > best.n {
+			best = a
+		}
+	}
+	y := math.Min(math.Max(float64(best.sy)/float64(best.n), 0), 300)
+	return Cam{X: float64(best.sx) / float64(best.n), Y: y, Z: float64(best.sz) / float64(best.n), Dist: 45, Rot: -0.6, Angle: 0.9}, true
+}
+
+func floorDiv(a, b int) int {
+	q := a / b
+	if a%b != 0 && (a < 0) != (b < 0) {
+		q--
+	}
+	return q
+}
+
+// CoreBox は、壊した数の 97% が入る範囲の枠 (x0, z0, x1, z1)。遠くに離れた少数の点で、枠が画面を埋めないように、
+// 外側の 1.5% ずつを除く。列が無いときは、範囲そのもの。
+func CoreBox(s *Stats) [4]int {
+	if len(s.Columns) == 0 {
+		return [4]int{s.X0, s.Z0, s.X1 + 1, s.Z1 + 1}
+	}
+	kx := func(c Column) int { return c.X }
+	kz := func(c Column) int { return c.Z }
+	return [4]int{
+		int(weightedQuantile(s.Columns, kx, 0.015)) - 1, int(weightedQuantile(s.Columns, kz, 0.015)) - 1,
+		int(weightedQuantile(s.Columns, kx, 0.985)) + 2, int(weightedQuantile(s.Columns, kz, 0.985)) + 2,
+	}
+}
+
+// weightedQuantile は、壊した数で重みを付けた q (0〜1) の分位点。
+func weightedQuantile(cols []Column, key func(Column) int, q float64) float64 {
+	idx := make([]int, len(cols))
+	total := 0
+	for i, c := range cols {
+		idx[i] = i
+		total += c.N
+	}
+	sort.Slice(idx, func(a, b int) bool { return key(cols[idx[a]]) < key(cols[idx[b]]) })
+	acc := 0
+	for _, i := range idx {
+		acc += cols[i].N
+		if float64(acc) >= q*float64(total) {
+			return float64(key(cols[i]))
+		}
+	}
+	return float64(key(cols[idx[len(idx)-1]]))
 }
 
 func weightedMedian(cols []Column, key func(Column) int) float64 {
@@ -91,6 +166,8 @@ type Shooter struct {
 	Flags   []string
 	W, H    int
 	MaxWait time.Duration
+
+	LastOverlay string // 直前に印を描いた結果 (確認用)
 }
 
 func NewShooter(c *Config) *Shooter {
@@ -120,8 +197,103 @@ const tilesLoadedJS = `(() => {
 // hideUICSS は、操作の部品 (#app 以下) を消して、地図だけを撮る。
 const hideUICSS = `#app{display:none!important}`
 
-// Shot は地図を開いて、タイルが読み終わるまで待ち、PNG を out に書く。
-func (s *Shooter) Shot(ctx context.Context, mapID string, cam Cam, out string) error {
+// Pillar は、壊された 1 列 (x, z) とその高さ。画面では、縦の赤い線になる。
+type Pillar struct {
+	X, Z   int
+	Y0, Y1 int
+	N      int
+}
+
+// Annot は、撮った画面の上に重ねる印。BlueMap は「いまの地形」しか描かないので、穴や欠けだけでは
+// どこが荒らされたか分からない。壊された列を赤い線で、荒らされた範囲を黄色の枠で示す。
+// 文字は ASCII だけ (実行する環境には日本語のフォントが無い)。
+type Annot struct {
+	Label    string   // 左上に書く 1 行目
+	Sub      string   // 2 行目
+	Pillars  []Pillar // 赤い線 (復旧後の画面では空)
+	Box      [4]int   // 枠: x0, z0, x1, z1
+	BoxY     int      // 枠を置く高さ
+	BoxColor string   // 枠の色 (CSS)
+	NoBox    bool     // 枠を描かない (寄った画面では、枠が画面を横切るだけなので)
+}
+
+// maxPillars は、1 枚に描く列の数の上限 (多いときは、壊した数が多い列を残す)。
+const maxPillars = 6000
+
+// AnnotFor は Stats から、被害の画面に重ねる印を作る。
+func AnnotFor(s *Stats, label, sub string, withPillars bool) *Annot {
+	a := &Annot{Label: label, Sub: sub, Box: CoreBox(s), BoxY: s.Y0, BoxColor: "#ffd400"}
+	if withPillars {
+		for _, c := range s.TopBreakColumns(maxPillars) {
+			a.Pillars = append(a.Pillars, Pillar{X: c.X, Z: c.Z, Y0: c.Y0, Y1: c.Y1, N: c.N})
+		}
+	}
+	return a
+}
+
+// overlayJS は、いまのカメラの行列で、世界の座標を画面の点にして、全画面の canvas に描く。
+// 返す文字列は、描いた結果 (ok:… または、できなかった理由)。
+const overlayJS = `((a) => {
+  const b = window.bluemap;
+  const cam = b && b.mapViewer && b.mapViewer.camera;
+  if (!cam) return 'no camera';
+  cam.updateMatrixWorld(true);
+  const V = cam.matrixWorldInverse.elements, P = cam.projectionMatrix.elements;
+  const W = window.innerWidth, H = window.innerHeight;
+  const proj = (x, y, z) => {
+    const vx = V[0]*x + V[4]*y + V[8]*z + V[12], vy = V[1]*x + V[5]*y + V[9]*z + V[13],
+          vz = V[2]*x + V[6]*y + V[10]*z + V[14], vw = V[3]*x + V[7]*y + V[11]*z + V[15];
+    const cx = P[0]*vx + P[4]*vy + P[8]*vz + P[12]*vw, cy = P[1]*vx + P[5]*vy + P[9]*vz + P[13]*vw,
+          cw = P[3]*vx + P[7]*vy + P[11]*vz + P[15]*vw;
+    if (!(cw > 0)) return null;
+    return [(cx / cw * 0.5 + 0.5) * W, (1 - (cy / cw * 0.5 + 0.5)) * H];
+  };
+  const cv = document.createElement('canvas');
+  cv.width = W; cv.height = H;
+  cv.style.cssText = 'position:fixed;left:0;top:0;width:' + W + 'px;height:' + H + 'px;z-index:2147483647;pointer-events:none';
+  document.body.appendChild(cv);
+  const g = cv.getContext('2d');
+  let drawn = 0;
+  g.lineCap = 'round';
+  for (const p of (a.pillars || [])) {
+    const lo = proj(p.x + 0.5, p.y0, p.z + 0.5), hi = proj(p.x + 0.5, p.y1 + 1, p.z + 0.5);
+    if (!lo || !hi) continue;
+    g.strokeStyle = 'rgba(255,30,30,0.55)'; g.lineWidth = 4;
+    g.beginPath(); g.moveTo(lo[0], lo[1]); g.lineTo(hi[0], hi[1]); g.stroke();
+    g.fillStyle = 'rgba(255,60,60,0.75)';
+    g.beginPath(); g.arc(hi[0], hi[1], 3, 0, 6.2832); g.fill();
+    drawn++;
+  }
+  const [x0, z0, x1, z1] = a.box || [0, 0, 0, 0], by = a.boxY;
+  const cs = a.box ? [proj(x0, by, z0), proj(x1, by, z0), proj(x1, by, z1), proj(x0, by, z1)] : [];
+  if (a.box && cs.every(Boolean)) {
+    g.beginPath(); g.moveTo(cs[0][0], cs[0][1]); for (let i = 1; i < 4; i++) g.lineTo(cs[i][0], cs[i][1]); g.closePath();
+    g.setLineDash([16, 10]); g.lineWidth = 7; g.strokeStyle = 'rgba(0,0,0,0.7)'; g.stroke();
+    g.lineWidth = 4; g.strokeStyle = a.boxColor; g.stroke(); g.setLineDash([]);
+  }
+  const lines = [a.label, a.sub].filter(Boolean);
+  g.font = 'bold 22px monospace';
+  const tw = Math.max(...lines.map(s => g.measureText(s).width)) + 24;
+  g.fillStyle = 'rgba(10,10,14,0.82)'; g.fillRect(12, 12, tw, 16 + lines.length * 30);
+  lines.forEach((s, i) => { g.fillStyle = i === 0 ? '#ff5a5a' : '#e8e8ee'; g.fillText(s, 24, 42 + i * 30); });
+  return 'ok:' + drawn + ' pillars, box=' + (a.box ? cs.every(Boolean) : 'none');
+})`
+
+// overlayArg は、JS に渡す形 (キーは小文字)。
+func (a *Annot) overlayArg() map[string]any {
+	ps := make([]map[string]int, 0, len(a.Pillars))
+	for _, p := range a.Pillars {
+		ps = append(ps, map[string]int{"x": p.X, "z": p.Z, "y0": p.Y0, "y1": p.Y1, "n": p.N})
+	}
+	arg := map[string]any{"label": a.Label, "sub": a.Sub, "pillars": ps, "boxY": a.BoxY, "boxColor": a.BoxColor}
+	if !a.NoBox {
+		arg["box"] = a.Box
+	}
+	return arg
+}
+
+// Shot は地図を開いて、タイルが読み終わるまで待ち、(ann があれば印を重ねて) PNG を out に書く。
+func (s *Shooter) Shot(ctx context.Context, mapID string, cam Cam, out string, ann *Annot) error {
 	opts := append([]chromedp.ExecAllocatorOption{}, chromedp.DefaultExecAllocatorOptions[:]...)
 	opts = append(opts, chromedp.WindowSize(s.W, s.H))
 	if s.Chrome != "" {
@@ -173,6 +345,19 @@ func (s *Shooter) Shot(ctx context.Context, mapID string, cam Cam, out string) e
 		case <-cctx.Done():
 			return cctx.Err()
 		}
+	}
+
+	if ann != nil {
+		arg, err := json.Marshal(ann.overlayArg())
+		if err != nil {
+			return err
+		}
+		// 印が描けなくても、印の無い画面は撮る (無いよりよい)。結果は LastOverlay に残す
+		var res string
+		if err := chromedp.Run(cctx, chromedp.Evaluate(overlayJS+"("+string(arg)+")", &res)); err != nil {
+			res = "failed: " + err.Error()
+		}
+		s.LastOverlay = res
 	}
 
 	var buf []byte
