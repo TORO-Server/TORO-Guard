@@ -46,14 +46,21 @@ func NewReporter(mcp *MCP, token, channelID, rollbackTagID string) *Reporter {
 	return &Reporter{mcp: mcp, auth: "Bot " + token, channelID: channelID, tagID: rollbackTagID}
 }
 
-// reporterFor は設定から、DiscordSRV のトークンと Discord-MCP を使う Reporter を作る。
+// reporterFor は設定から、ボットのトークンと Discord-MCP を使う Reporter を作る。
+// DISCORD_BOT_TOKEN (または _FILE) があれば、それを使う。無ければ DiscordSRV の config.yml から読む。
 func reporterFor(cfg *Config) (*Reporter, error) {
-	tok, err := LoadBotToken(cfg.DiscordSRVConfig)
-	if err != nil {
-		return nil, fmt.Errorf("discordsrv token: %w", err)
+	tok := cfg.BotToken
+	if tok == "" {
+		var err error
+		if tok, err = LoadBotToken(cfg.DiscordSRVConfig); err != nil {
+			return nil, fmt.Errorf("discordsrv token: %w", err)
+		}
 	}
 	return NewReporter(NewMCP(cfg.DiscordMCPURL, cfg.MCPProtocol, cfg.DiscordMCPLazy), tok, cfg.ReportChannelID, cfg.RollbackTagID), nil
 }
+
+// noMentions は、投稿の allowed_mentions。文字に @everyone などがあっても、だれにも通知しない。
+func noMentions() map[string]any { return map[string]any{"parse": []string{}} }
 
 // Check は投稿せずに、MCP とトークンとチャンネルが使えるか確かめる。
 func (r *Reporter) Check(ctx context.Context) (string, error) {
@@ -133,7 +140,7 @@ func (r *Reporter) PostTags(ctx context.Context, existing, title, content string
 	if existing != "" {
 		_, err := r.mcp.Discord(ctx, DiscordCall{
 			Tool: "discord_create_message", PathParams: map[string]any{"channel_id": existing},
-			Body: map[string]any{"content": content}, Files: mf, Fields: "id", Auth: r.auth,
+			Body: map[string]any{"content": content, "allowed_mentions": noMentions()}, Files: mf, Fields: "id", Auth: r.auth,
 		})
 		if err == nil {
 			if len(tags) > 0 {
@@ -152,7 +159,7 @@ func (r *Reporter) PostTags(ctx context.Context, existing, title, content string
 			"name":                  title,
 			"auto_archive_duration": 10080,
 			"applied_tags":          tags,
-			"message":               map[string]any{"content": content},
+			"message":               map[string]any{"content": content, "allowed_mentions": noMentions()},
 		},
 		Files: mf, Fields: "id", Auth: r.auth,
 	})

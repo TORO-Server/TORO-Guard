@@ -16,7 +16,6 @@ type Outcome struct {
 	RestoreCmd  string
 	RolledDone  int
 	RolledTotal int
-	Lines       []string
 	Error       string
 	Kicked      bool
 	AI          *Verdict // AI の判定 (使わないときは nil)
@@ -49,6 +48,9 @@ type ReportInput struct {
 // ThreadTitle はフォーラムの投稿の名前。この通報チャンネルでは、荒らしの名前にしている。
 func ThreadTitle(s *Stats) string { return s.User.Name }
 
+// noCmdText は、名前かワールドの形が安全でなく、コマンドを書けないときの文。
+const noCmdText = "名前かワールドの形が正しくないので、コマンドを作れません。運営が記録を確かめてください"
+
 // BuildReport は通報チャンネルの規則 (ワールド名・荒らしプレイヤーの名前・証拠画像) に合わせた本文。
 // このチャンネルでは、ボットに「埋め込みのリンク」の権限が無いので、埋め込み (embed) は使わず、
 // 本文は普通の文字だけにする。
@@ -58,8 +60,8 @@ func BuildReport(in ReportInput) string {
 	if in.Mode == ModeDryRun {
 		b.WriteString("**[試運転: 投稿もロールバックもしていません]**\n")
 	}
-	fmt.Fprintf(&b, "**ワールド**: %s\n", orDash(s.World))
-	fmt.Fprintf(&b, "**荒らしプレイヤー**: %s (`%s`)\n", s.User.Name, s.User.UUID)
+	fmt.Fprintf(&b, "**ワールド**: %s\n", safeChat(orDash(s.World), 64))
+	fmt.Fprintf(&b, "**荒らしプレイヤー**: %s (`%s`)\n", safeChat(s.User.Name, 40), safeChat(s.User.UUID, 40))
 	if in.Center != nil {
 		fmt.Fprintf(&b, "**座標**: %.0f %.0f 付近 (x z)\n", in.Center.X, in.Center.Z)
 	}
@@ -80,7 +82,7 @@ func BuildReport(in ReportInput) string {
 			if i == 5 {
 				break
 			}
-			parts = append(parts, fmt.Sprintf("%s %s", m.Material, comma(m.Count)))
+			parts = append(parts, fmt.Sprintf("%s %s", safeChat(m.Material, 40), comma(m.Count)))
 		}
 		fmt.Fprintf(&b, "**主な破壊**: %s\n", strings.Join(parts, ", "))
 	}
@@ -98,17 +100,21 @@ func BuildReport(in ReportInput) string {
 		fmt.Fprintf(&b, "**AI の判定**: %s (確からしさ %d%%) %s\n", verdictJP(in.Out.AI.Verdict), in.Out.AI.Confidence, in.Out.AI.Summary)
 	}
 	switch {
+	case in.Out.Skipped != "" && in.Out.Cmd == "":
+		fmt.Fprintf(&b, "**対応**: 自動ロールバックはしていません (%s)。%s\n", in.Out.Skipped, noCmdText)
 	case in.Out.Skipped != "":
 		fmt.Fprintf(&b, "**対応**: 自動ロールバックはしていません (%s)。運営が確認してください。ロールバックするときは `%s`\n", in.Out.Skipped, in.Out.Cmd)
 	case in.Out.RolledBack:
 		fmt.Fprintf(&b, "**対応**: CoreProtect で自動ロールバック済み (%s / %s 件)\n", comma(in.Out.RolledDone), comma(in.Out.RolledTotal))
+	case in.Out.Planned && in.Out.Cmd == "":
+		fmt.Fprintf(&b, "**ロールバック (未実行)**: %s\n", noCmdText)
 	case in.Out.Planned && in.Out.CmdUntil > 0:
 		fmt.Fprintf(&b, "**ロールバック (未実行)**: `%s`\n", in.Out.Cmd)
 		fmt.Fprintf(&b, "%s までに実行してください。それより後は、t: を「実行する時刻 − %s」より長くしてください。\n", fmtT(in.Out.CmdUntil), fmtT(s.From))
 	case in.Out.Planned:
 		fmt.Fprintf(&b, "**対応 (予定)**: `%s`\n", in.Out.Cmd)
 	case in.Out.Error != "":
-		fmt.Fprintf(&b, "**対応**: 自動ロールバックに失敗 (%s)。手動で確認してください\n", in.Out.Error)
+		fmt.Fprintf(&b, "**対応**: 自動ロールバックに失敗 (%s)。手動で確認してください\n", safeChat(in.Out.Error, 200))
 	}
 	if in.Out.Kicked {
 		b.WriteString("**対応**: キック済み\n")
@@ -185,10 +191,7 @@ func summarizeCommands(cmds []string) []string {
 	}
 	out := make([]string, 0, len(order))
 	for _, key := range order {
-		disp := key
-		if len([]rune(disp)) > 60 {
-			disp = string([]rune(disp)[:60]) + "…"
-		}
+		disp := safeChat(key, 60) // プレイヤーが書いた文字。インラインコードを閉じられないようにする
 		if n[key] > 1 {
 			out = append(out, fmt.Sprintf("`%s` ×%d", disp, n[key]))
 		} else {
@@ -203,5 +206,5 @@ func WarpText(w Warp, dist float64) string {
 	if dist > 600 {
 		return ""
 	}
-	return fmt.Sprintf("ワープ %s の近く (約 %d ブロック)", w.Name, int(dist+0.5))
+	return fmt.Sprintf("ワープ %s の近く (約 %d ブロック)", safeChat(w.Name, 40), int(dist+0.5))
 }

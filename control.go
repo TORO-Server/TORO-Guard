@@ -3,12 +3,15 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -43,6 +46,7 @@ import (
 
 // defaultDiscordAllow は、窓口から呼べる Discord のツール。読むことと、投稿・タグ付けだけ。
 // BAN・キック・ロールの変更・チャンネルやメッセージの削除は含めない。
+// チャンネルを指定するツールは、さらに通報フォーラムとそのスレッドだけに限る (checkDiscordCall)。
 const defaultDiscordAllow = `^discord_(get_my_user|get_channel|list_channel_messages|list_messages|get_message|get_channel_message|create_message|create_thread|update_channel|list_guild_channels|list_guild_roles|get_guild_member|search_guild_members|list_active_guild_threads|list_thread_members)$`
 
 const maxBody = 1 << 20
@@ -127,9 +131,21 @@ func (c *Control) who(r *http.Request) string {
 	return "unknown"
 }
 
+// auditKey は、audit.jsonl の 1 行に足す項目 (map) を、リクエストに持たせる鍵。
+type auditKey struct{}
+
+// auditAdd は、audit.jsonl の 1 行に項目を足す。
+func auditAdd(r *http.Request, key string, value any) {
+	if m, ok := r.Context().Value(auditKey{}).(map[string]any); ok {
+		m[key] = value
+	}
+}
+
 // wrap は handler の返したエラーを、状態コードに直し、書き換える操作を audit.jsonl に残す。
 func (c *Control) wrap(h func(r *http.Request) (*result, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		extra := map[string]any{}
+		r = r.WithContext(context.WithValue(r.Context(), auditKey{}, extra))
 		res, err := h(r)
 		code := http.StatusOK
 		switch {
@@ -152,7 +168,7 @@ func (c *Control) wrap(h func(r *http.Request) (*result, error)) http.HandlerFun
 			c.log.Error("窓口の処理に失敗", "path", r.URL.Path, "err", err)
 		}
 		if r.Method != http.MethodGet {
-			c.record(r, code, err)
+			c.record(r, code, err, extra)
 		}
 		if err != nil {
 			writeJSONResp(w, code, map[string]any{"error": err.Error()})
@@ -168,8 +184,9 @@ func badRequest(format string, a ...any) error {
 	return fmt.Errorf("%w: %s", errBadRequest, fmt.Sprintf(format, a...))
 }
 
-func (c *Control) record(r *http.Request, code int, err error) {
+func (c *Control) record(r *http.Request, code int, err error, extra map[string]any) {
 	line := map[string]any{"t": time.Now().Unix(), "user": c.who(r), "method": r.Method, "path": r.URL.Path, "status": code}
+	maps.Copy(line, extra)
 	if err != nil {
 		line["error"] = oneLine(err.Error(), 200)
 	}
@@ -294,7 +311,7 @@ func (c *Control) activity(r *http.Request) (*result, error) {
 	hours := 6.0
 	if v := r.URL.Query().Get("hours"); v != "" {
 		h, err := strconv.ParseFloat(v, 64)
-		if err != nil || h <= 0 || h > 72 {
+		if err != nil || math.IsNaN(h) || h <= 0 || h > 72 {
 			return nil, badRequest("hours は 0 より大きく 72 まで")
 		}
 		hours = h
@@ -426,11 +443,10 @@ func (c *Control) mute(r *http.Request) (*result, error) {
 	if err := readBody(r, &in); err != nil {
 		return nil, err
 	}
-	out, err := c.g.Mute(r.Context(), r.PathValue("name"), c.who(r), in.Reason)
-	if err != nil {
+	if err := c.g.Mute(r.Context(), r.PathValue("name"), c.who(r), in.Reason); err != nil {
 		return nil, err
 	}
-	return &result{body: map[string]any{"ok": true, "console": out}}, nil
+	return &result{body: map[string]any{"ok": true}}, nil
 }
 
 func (c *Control) kick(r *http.Request) (*result, error) {
@@ -438,11 +454,10 @@ func (c *Control) kick(r *http.Request) (*result, error) {
 	if err := readBody(r, &in); err != nil {
 		return nil, err
 	}
-	out, err := c.g.Kick(r.Context(), r.PathValue("name"), c.who(r), in.Reason)
-	if err != nil {
+	if err := c.g.Kick(r.Context(), r.PathValue("name"), c.who(r), in.Reason); err != nil {
 		return nil, err
 	}
-	return &result{body: map[string]any{"ok": true, "console": out}}, nil
+	return &result{body: map[string]any{"ok": true}}, nil
 }
 
 // shotJob は、裏で撮っている BlueMap の画像 1 枚。
@@ -612,6 +627,7 @@ func (c *Control) discordCall(r *http.Request) (*result, error) {
 	if err := readBody(r, &in); err != nil {
 		return nil, err
 	}
+	auditAdd(r, "tool", oneLine(in.Tool, 80))
 	if !c.allow.MatchString(in.Tool) {
 		return nil, fmt.Errorf("%w: ツール %q は許可していません (許可: discord_tools で確かめてください)", ErrForbidden, in.Tool)
 	}
@@ -621,9 +637,23 @@ func (c *Control) discordCall(r *http.Request) (*result, error) {
 	if err := c.g.checkMode(); err != nil {
 		return nil, err
 	}
+	if id, ok := in.PathParams["channel_id"].(string); ok {
+		auditAdd(r, "channel", oneLine(id, 32))
+	}
+	if err := limitDiscordBody(in.Tool, in.Body); err != nil {
+		return nil, err
+	}
+	if err := c.checkDiscordCall(r.Context(), in.Tool, in.PathParams); err != nil {
+		return nil, err
+	}
+	if b, err := json.Marshal(in.Body); err == nil && in.Body != nil {
+		sum := sha256.Sum256(b)
+		auditAdd(r, "body_sha256", hex.EncodeToString(sum[:]))
+	}
 	out, err := c.g.reporter.mcp.Discord(r.Context(), DiscordCall{
 		Tool: in.Tool, PathParams: in.PathParams, Body: in.Body, Query: in.Query, Fields: in.Fields, Auth: c.g.reporter.auth,
-		Reason: cleanText(in.Reason+" (by "+c.who(r)+")", 200),
+		// 理由は 200 文字で切れるので、頼んだ人の名前を先に書く
+		Reason: cleanText(c.who(r)+": "+in.Reason, 200),
 	})
 	if err != nil {
 		return nil, err
@@ -632,4 +662,80 @@ func (c *Control) discordCall(r *http.Request) (*result, error) {
 		out = out[:maxDiscordReply] + "\n…(長いので切りました)"
 	}
 	return &result{body: map[string]any{"result": out}}, nil
+}
+
+var (
+	snowflakeRE = regexp.MustCompile(`^[0-9]{17,20}$`)
+	pathParamRE = regexp.MustCompile(`^[a-z_]{1,32}$`)
+)
+
+// discordGuildTools は、チャンネルを指定しないツール。ほかのツールは、channel_id が要る。
+var discordGuildTools = map[string]bool{
+	"discord_get_my_user": true, "discord_list_guild_channels": true, "discord_list_guild_roles": true,
+	"discord_get_guild_member": true, "discord_search_guild_members": true, "discord_list_active_guild_threads": true,
+}
+
+// checkDiscordCall は、パスの値が ID の形か、チャンネルが通報フォーラムかそのスレッドかを確かめる。
+func (c *Control) checkDiscordCall(ctx context.Context, tool string, params map[string]any) error {
+	for k, v := range params {
+		id, ok := v.(string)
+		if !pathParamRE.MatchString(k) || !ok || !snowflakeRE.MatchString(id) {
+			return badRequest("pathParams の %q は Discord の ID にしてください", oneLine(k, 32))
+		}
+	}
+	if discordGuildTools[tool] {
+		return nil
+	}
+	id, _ := params["channel_id"].(string)
+	if id == "" {
+		return badRequest("pathParams.channel_id が要ります")
+	}
+	rep := c.g.reporter
+	if id == rep.channelID {
+		return nil
+	}
+	notAllowed := fmt.Errorf("%w: 通報フォーラムとそのスレッドのほかは、触れません", ErrForbidden)
+	if tool == "discord_create_thread" {
+		return notAllowed
+	}
+	out, err := rep.mcp.Discord(ctx, DiscordCall{Tool: "discord_get_channel", PathParams: map[string]any{"channel_id": id}, Fields: "id,parent_id", Auth: rep.auth})
+	if err != nil {
+		return notAllowed // Discord が見せないチャンネルは、確かめられないので断る
+	}
+	var ch struct {
+		ParentID string `json:"parent_id"`
+	}
+	if err := json.Unmarshal([]byte(out), &ch); err != nil || ch.ParentID != rep.channelID {
+		return notAllowed
+	}
+	return nil
+}
+
+// limitDiscordBody は、本文の決まりを当てはめる。だれにも通知しない設定は、呼ぶ側に選ばせない。
+// update_channel は、タグだけを変えられる (名前や権限などは変えさせない)。
+func limitDiscordBody(tool string, body map[string]any) error {
+	switch tool {
+	case "discord_update_channel":
+		tags, ok := body["applied_tags"].([]any)
+		if !ok || len(body) != 1 {
+			return fmt.Errorf("%w: update_channel で変えられるのは applied_tags だけです", ErrForbidden)
+		}
+		for _, t := range tags {
+			if id, ok := t.(string); !ok || !snowflakeRE.MatchString(id) {
+				return badRequest("applied_tags は Discord の ID の配列にしてください")
+			}
+		}
+	case "discord_create_message":
+		if body == nil {
+			return badRequest("body が要ります")
+		}
+		body["allowed_mentions"] = noMentions()
+	case "discord_create_thread":
+		msg, ok := body["message"].(map[string]any)
+		if !ok {
+			return badRequest("body.message が要ります")
+		}
+		msg["allowed_mentions"] = noMentions()
+	}
+	return nil
 }

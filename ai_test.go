@@ -108,6 +108,12 @@ func TestReviewChat(t *testing.T) {
 	if len(flags) != 1 || flags[0].ID != 1 || flags[0].Category != "harassment" || flags[0].Confidence != 88 {
 		t.Fatalf("範囲外の番号は捨てる: %+v", flags)
 	}
+	// category は報告文に載るので、決めた言葉だけにする
+	for in, want := range map[string]string{"Spam": "spam", " hate ": "hate", "other": "other", "[x](https://example.com)": "other", "": "other"} {
+		if got := chatCategory(in); got != want {
+			t.Errorf("chatCategory(%q) = %q", in, got)
+		}
+	}
 	text := req["messages"].([]any)[0].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string)
 	if !strings.Contains(text, "[1] ") || !strings.Contains(text, "bob: ひどい発言 の例") || strings.Count(text, "\n") != 2 {
 		t.Fatalf("発言は 1 行ずつ、番号つきで渡す: %q", text)

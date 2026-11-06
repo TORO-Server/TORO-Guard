@@ -19,7 +19,8 @@ type Incident struct {
 	Last    int64  `json:"last"`
 	Trigger string `json:"trigger"`
 	Queued  bool   `json:"queued,omitempty"`
-	Kind    string `json:"kind,omitempty"` // "" はブロックの荒らし、"chat" はチャットのスパム
+	Kind    string `json:"kind,omitempty"`    // "" はブロックの荒らし、"chat" はチャットのスパム
+	AIOnly  bool   `json:"ai_only,omitempty"` // AI の判定だけで開いた事件 (チャット)。ミュートせず、通報だけにする
 }
 
 // Key は Incidents の鍵。同じ人でも、ブロックの荒らしとチャットのスパムは別の事件にする。

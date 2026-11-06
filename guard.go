@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,16 +32,43 @@ type Guard struct {
 	queue      chan *Incident
 	busy       map[string]string // 事件の ID → 裏で動いている操作 (g.mu を持って触る)
 
-	opMu  sync.Mutex // コンソールとブラウザを使う処理 (事件の処理、窓口からの操作) を 1 つずつにする
+	opMu  sync.Mutex // 時間のかかる処理 (事件の処理、ロールバック、撮影) を 1 つずつにする。キックとミュートは、これを待たない
 	recMu sync.Mutex // 事件の記録 (record.json) の読み書き
+
+	lastRefresh         time.Time     // 最後に書き出しと地図の更新を頼んだ時刻 (g.opMu を持って触る)
+	refreshEvery        time.Duration // 書き出しと地図の更新の間隔
+	rollbackConfirmWait time.Duration // データベースでロールバックを確かめ直す間隔
 }
+
+const (
+	// incidentDeadline は、1 件の処理の全体の期限。これを超えて g.opMu を持ち続けない。
+	incidentDeadline = 30 * time.Minute
+	// refreshInterval は、save-all flush と bluemap update の間隔。事件が続いても、サーバーへの負荷を増やさない。
+	refreshInterval = time.Minute
+	// rollbackConfirmTries は、ロールバックをデータベースで確かめる回数。
+	rollbackConfirmTries = 7
+	// maxBlueMapRadius は、1 回に描き直す半径の上限。範囲はプレイヤーの行動で決まるので、広がりすぎないようにする。
+	maxBlueMapRadius = 256
+	// healthEvery は、見張りが回っている印を書く間隔。
+	healthEvery = 30 * time.Second
+)
 
 func NewGuard(cfg *Config, cp *CP, st *Store, ops *Ops, sh *Shooter, rep *Reporter, log *slog.Logger) *Guard {
 	return &Guard{
 		cfg: cfg, cp: cp, det: NewDetector(cfg), cdet: NewChatDetector(cfg), ai: NewAI(cfg), store: st, ops: ops, shooter: sh, reporter: rep,
 		warps: LoadWarps(cfg.WarpsDir), log: log,
 		suppressed: map[int]int64{}, queue: make(chan *Incident, 16), busy: map[string]string{},
+		refreshEvery: refreshInterval, rollbackConfirmWait: 5 * time.Second,
 	}
+}
+
+// incidentID は事件の ID (フォルダの名前になる)。名前が ID に使えないときは、ユーザーの番号を使う (一覧から消えないように)。
+func incidentID(prefix string, at int64, name string, userID int) string {
+	base := prefix + time.Unix(at, 0).In(jst).Format("20060102-150405") + "-"
+	if id := base + name; validName(name) && validID(id) {
+		return id
+	}
+	return fmt.Sprintf("%suid%d", base, userID)
 }
 
 // Run は見張りの本体。ctx が終わるまで回る。
@@ -74,12 +102,20 @@ func (g *Guard) Run(ctx context.Context) error {
 	g.mu.Unlock()
 
 	go g.worker(ctx)
+	go g.sweepLoop(ctx)
 
 	tick := time.NewTicker(g.cfg.PollInterval)
 	defer tick.Stop()
+	var healthAt time.Time
 	for {
-		if err := g.step(ctx); err != nil && ctx.Err() == nil {
-			g.log.Error("見張りの 1 回が失敗", "err", err)
+		if err := g.step(ctx); err != nil {
+			if ctx.Err() == nil {
+				g.log.Error("見張りの 1 回が失敗", "err", err)
+			}
+		} else if time.Since(healthAt) >= healthEvery {
+			// healthcheck は、見張りの 1 回が最後に成功した時刻で判定する
+			touchHealth(g.cfg)
+			healthAt = time.Now()
 		}
 		select {
 		case <-ctx.Done():
@@ -173,18 +209,37 @@ func (g *Guard) aiChat(ctx context.Context, msgs []ChatMsg, now int64) map[int64
 			}
 		}
 	}
-	list, err := g.ai.ReviewChat(ctx, fresh, names)
-	if err != nil {
-		g.log.Warn("AI のチャットの判定が取れない (決まりだけで見張る)", "err", err)
-		return nil
-	}
+	// 1 人ずつ尋ねる (ほかの人の発言の文字が、その人の判定に影響しないように)
 	out := map[int64]*ChatFlag{}
-	for i := range list {
-		f := list[i]
-		if f.Confidence < g.cfg.AIMinConf {
+	for _, part := range chatByUser(fresh) {
+		list, err := g.ai.ReviewChat(ctx, part, names)
+		if err != nil {
+			g.log.Warn("AI のチャットの判定が取れない (決まりだけで見張る)", "err", err)
 			continue
 		}
-		out[fresh[f.ID].RowID] = &f
+		for i := range list {
+			f := list[i]
+			if f.Confidence < g.cfg.AIMinConf {
+				continue
+			}
+			out[part[f.ID].RowID] = &f
+		}
+	}
+	return out
+}
+
+// chatByUser は、発言を人ごとに分ける。人の順は最初の発言の順、発言の順はそのまま。
+func chatByUser(msgs []ChatMsg) [][]ChatMsg {
+	index := map[int]int{}
+	var out [][]ChatMsg
+	for _, m := range msgs {
+		i, ok := index[m.User]
+		if !ok {
+			i = len(out)
+			index[m.User] = i
+			out = append(out, nil)
+		}
+		out[i] = append(out[i], m)
 	}
 	return out
 }
@@ -192,14 +247,19 @@ func (g *Guard) aiChat(ctx context.Context, msgs []ChatMsg, now int64) map[int64
 // onChat は g.mu を持って呼ぶ。flag は、AI がこの発言を対応すべきと判定したとき (無ければ nil)。
 func (g *Guard) onChat(ctx context.Context, m ChatMsg, flag *ChatFlag) {
 	key := chatKey(m.User)
-	if inc := g.store.S.Incidents[key]; inc != nil && m.Time > inc.Last {
-		inc.Last = m.Time
+	open := g.store.S.Incidents[key]
+	if open != nil && m.Time > open.Last {
+		open.Last = m.Time
 	}
 	t := g.cdet.Feed(m)
+	// 決まりの検知が重なったら、AI の判定だけの事件ではなくなる
+	if t != nil && open != nil && open.AIOnly {
+		open.AIOnly, open.Trigger = false, t.String()
+	}
 	if t == nil && flag != nil {
 		t = &ChatTrigger{User: m.User, Time: m.Time, Kind: "ai", Detail: fmt.Sprintf("%s (確からしさ %d%%) %s", flag.Category, flag.Confidence, flag.Summary)}
 	}
-	if t == nil || g.store.S.Incidents[key] != nil || m.Time < g.suppressed[-m.User] {
+	if t == nil || open != nil || m.Time < g.suppressed[-m.User] {
 		return
 	}
 	u, err := g.cp.User(ctx, m.User)
@@ -214,8 +274,8 @@ func (g *Guard) onChat(ctx context.Context, m ChatMsg, flag *ChatFlag) {
 		return
 	}
 	inc := &Incident{
-		ID:     fmt.Sprintf("chat-%s-%s", time.Unix(m.Time, 0).In(jst).Format("20060102-150405"), u.Name),
-		UserID: m.User, Name: u.Name, UUID: u.UUID, Kind: "chat",
+		ID:     incidentID("chat-", m.Time, u.Name, m.User),
+		UserID: m.User, Name: u.Name, UUID: u.UUID, Kind: "chat", AIOnly: t.Kind == "ai",
 		Start: m.Time, Last: m.Time, Trigger: t.String(),
 	}
 	g.store.S.Incidents[key] = inc
@@ -266,26 +326,35 @@ func (g *Guard) consider(ctx context.Context, t Trigger, e Event) {
 	if err != nil {
 		g.log.Error("コマンドの確認に失敗", "err", err)
 	}
+	trigger := t.String()
 	if cmd != "" {
-		suppress("edit command: "+cmd, 10*time.Minute)
-		return
+		// 文字列が一致しただけで、権限も成否も分からない。人が見る review では隠さず、事件に書いて確認待ちに置く
+		if g.cfg.Mode != ModeReview {
+			suppress("edit command: "+cmd, 10*time.Minute)
+			return
+		}
+		trigger += " / 編集コマンドの使用あり (権限と成否は未確認): " + safeChat(cmd, 60)
 	}
 
 	inc := &Incident{
-		ID:     fmt.Sprintf("%s-%s", time.Unix(e.Time, 0).In(jst).Format("20060102-150405"), u.Name),
+		ID:     incidentID("", e.Time, u.Name, t.User),
 		UserID: t.User, Name: u.Name, UUID: u.UUID,
-		Start: e.Time - int64(t.Window), Last: e.Time, Trigger: t.String(),
+		Start: e.Time - int64(t.Window), Last: e.Time, Trigger: trigger,
 	}
 	g.store.S.Incidents[fmt.Sprint(t.User)] = inc
-	g.log.Warn("荒らしを検知", "player", u.Name, "uuid", u.UUID, "trigger", t.String(), "incident", inc.ID, "mode", g.cfg.Mode)
+	g.log.Warn("荒らしを検知", "player", u.Name, "uuid", u.UUID, "trigger", trigger, "incident", inc.ID, "mode", g.cfg.Mode)
 
 	if g.cfg.Mode == ModeLive && g.cfg.KickEnabled && g.ops != nil {
-		if err := g.ops.Kick(ctx, u.Name, "ブロックを不自然な速さで変えたため"); err != nil {
-			g.log.Error("キックに失敗", "err", err)
-		} else {
-			g.log.Warn("キックした", "player", u.Name)
-		}
+		go g.kickDetected(ctx, u.Name) // g.mu を持ったままコンソールを待たない
 	}
+}
+
+func (g *Guard) kickDetected(ctx context.Context, name string) {
+	if err := g.ops.Kick(ctx, name, "ブロックを不自然な速さで変えたため"); err != nil {
+		g.log.Error("キックに失敗", "err", err)
+		return
+	}
+	g.log.Warn("キックした", "player", name)
 }
 
 // closeIdle は、動きが止まった (または長すぎる) 事件を閉じて、報告のキューに入れる (g.mu を持って呼ぶ)。
@@ -337,6 +406,8 @@ func (g *Guard) worker(ctx context.Context) {
 func (g *Guard) handle(ctx context.Context, inc *Incident) {
 	g.opMu.Lock()
 	defer g.opMu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, incidentDeadline)
+	defer cancel()
 	if inc.Kind == "chat" {
 		if res, err := g.ProcessChat(ctx, inc, time.Now().Unix()); err != nil {
 			g.log.Error("チャットの事件の処理に失敗", "incident", inc.ID, "err", err)
@@ -373,6 +444,9 @@ func (g *Guard) Process(ctx context.Context, inc *Incident) (*Result, error) {
 
 // processWindow は [inc.Start, end] の分を処理する (replay は、過去の end を渡す)。
 func (g *Guard) processWindow(ctx context.Context, inc *Incident, end int64) (*Result, error) {
+	if !validID(inc.ID) {
+		return nil, fmt.Errorf("事件の ID %q はフォルダに使えません", inc.ID)
+	}
 	user := UserInfo{ID: inc.UserID, Name: inc.Name, UUID: inc.UUID}
 	now := time.Now().Unix()
 	stats, err := g.cp.Stats(ctx, user, inc.Start-2, end)
@@ -436,23 +510,24 @@ func (g *Guard) processWindow(ctx context.Context, inc *Incident, end int64) (*R
 		out.Skipped = fmt.Sprintf("AI の判定が「%s」(確からしさ %d%%) で、基準 %d%% の「荒らし」に届かない", verdictJP(out.AI.Verdict), out.AI.Confidence, g.cfg.AIMinConf)
 	case g.cfg.AIRequired && out.AI == nil:
 		out.Skipped = "AI の判定が得られない (AI_REQUIRED=true)"
+	case now-inc.Start > maxRollbackAge:
+		out.Skipped = "事件から 24 時間より長くたっている"
 	}
 	restored := ""
 	switch {
 	case out.Skipped != "":
 		// ロールバックしない
 	case g.cfg.Mode == ModeLive && g.ops != nil:
-		lines, err := g.ops.Rollback(ctx, inc.Name, seconds, stats.World)
-		out.Lines = lines
-		done, total, derr := g.cp.RolledBack(ctx, inc.UserID, inc.Start-2, end)
+		err := g.ops.Rollback(ctx, inc.Name, seconds, stats.World)
+		done, total, ok, derr := g.confirmRollback(ctx, err, inc.UserID, stats.World, inc.Start-2, end)
 		if derr == nil {
 			out.RolledDone, out.RolledTotal = done, total
 		}
-		// コンソールの返事が取れなくても、データベースで「ほぼ全部ロールバックされた」なら成功とする
-		if err == nil || (derr == nil && total > 0 && done*100/total >= 95) {
+		// 判定の基準はデータベース。コンソールの返事が取れなくても、ほぼ全部が戻っていれば成功とする
+		if ok {
 			out.RolledBack = true
-		} else if err != nil {
-			out.Error = err.Error()
+		} else {
+			out.Error = rollbackError(err, done, total).Error()
 		}
 		if out.RolledBack {
 			restored = g.bluemapShot(ctx, mapID, stats, cam, filepath.Join(dir, "restored.png"),
@@ -501,7 +576,7 @@ func (g *Guard) processWindow(ctx context.Context, inc *Incident, end int64) (*R
 			existing = t.ThreadID
 		}
 		g.mu.Unlock()
-		id, err := g.reporter.Post(ctx, existing, ThreadTitle(stats), res.Report, files, out.RolledBack)
+		id, err := g.reporter.Post(ctx, existing, safeChat(ThreadTitle(stats), 90), res.Report, files, out.RolledBack)
 		if err != nil {
 			return res, fmt.Errorf("post: %w", err)
 		}
@@ -545,8 +620,11 @@ func (g *Guard) bluemapShot(ctx context.Context, mapID string, s *Stats, cam Cam
 		return ""
 	}
 	if g.ops != nil && refresh {
-		cx, cz := (s.X0+s.X1)/2, (s.Z0+s.Z1)/2
-		radius := maxInt(maxInt(s.X1-s.X0, s.Z1-s.Z0)/2+48, 64)
+		if err := g.waitRefresh(ctx); err != nil {
+			g.log.Warn("書き出しの順番を待ちきれない", "err", err)
+			return ""
+		}
+		cx, cz, radius := blueMapArea(s, cam)
 		if err := g.ops.SaveFlush(ctx); err != nil {
 			g.log.Warn("ワールドの書き出しに失敗", "err", err)
 		}
@@ -566,13 +644,36 @@ func (g *Guard) bluemapShot(ctx context.Context, mapID string, s *Stats, cam Cam
 	return out
 }
 
+// waitRefresh は、書き出しと地図の更新の間隔を空ける (g.opMu を持って呼ぶ)。
+func (g *Guard) waitRefresh(ctx context.Context) error {
+	if wait := time.Until(g.lastRefresh.Add(g.refreshEvery)); wait > 0 {
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	g.lastRefresh = time.Now()
+	return nil
+}
+
+// blueMapArea は、描き直す範囲。中心はカメラ (壊した数の中央値) で、半径は maxBlueMapRadius まで。
+func blueMapArea(s *Stats, cam Cam) (cx, cz, radius int) {
+	radius = maxInt(maxInt(s.X1-s.X0, s.Z1-s.Z0)/2+48, 64)
+	return int(math.Round(cam.X)), int(math.Round(cam.Z)), minInt(radius, maxBlueMapRadius)
+}
+
 func summaryOf(s *Stats) map[string]any {
+	commands := make([]string, 0, len(s.Commands))
+	for _, c := range s.Commands {
+		commands = append(commands, safeChat(c, 120)) // プレイヤーが書いた文字。短くして、1 行にする
+	}
 	return map[string]any{
 		"player": s.User.Name, "uuid": s.User.UUID, "world": s.World,
 		"from": s.From, "to": s.To, "breaks": s.Breaks, "places": s.Places, "clicks": s.Clicks,
 		"peak_per_s": s.PeakPerS, "peak_at": s.PeakAt,
 		"x": []int{s.X0, s.X1}, "y": []int{s.Y0, s.Y1}, "z": []int{s.Z0, s.Z1},
-		"top_breaks": s.TopBreaks, "commands": s.Commands, "containers": s.Containers,
+		"top_breaks": s.TopBreaks, "commands": commands, "containers": s.Containers,
 	}
 }
 

@@ -2,150 +2,104 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
-	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 )
 
 // Console は Minecraft のサーバーのコンソール。
-// toro-main には RCON も shell も無いので、本番では Docker の attach (docker attach と同じ) で行を送る。
+// toro-main には shell が無く、RCON のコマンドは Paper の非同期の制限で失敗するので、コンソールには attach でつなぐ。
+// Docker のソケットは toro-guard に置かず、中継 (toro-guard console-relay、relay.go) に頼む。
 type Console interface {
 	// Run は cmd を 1 行送り、出力の行を done が true を返すまで (または timeout まで) 集めて返す。
-	// done が nil なら、timeout まで集める。
+	// done が nil なら、timeout まで集める。done があるのに、出力が途中で切れたり timeout になったりしたら、エラーを返す。
 	Run(ctx context.Context, cmd string, timeout time.Duration, done func(line string) bool) ([]string, error)
 }
 
-var ansiRE = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[=>]`)
+const (
+	relayGrace      = 15 * time.Second // 中継の timeout より、これだけ長く待つ
+	maxRunLines     = 2000             // 1 回の Run で覚える行の数 (多いときは古いほうを捨てる)
+	sendOnlyTimeout = time.Second      // 出力を使わないコマンド (キック・ミュート) は、中継の枠をすぐ空ける
+)
 
-func cleanLine(s string) string {
-	s = ansiRE.ReplaceAllString(s, "")
-	s = strings.ReplaceAll(s, "\r", "")
-	return strings.TrimSpace(s)
+// RelayConsole は、中継の POST /run で Console を実装する。
+type RelayConsole struct {
+	URL string
+	hc  *http.Client
 }
 
-// DockerConsole は Docker Engine の API (unix ソケット) で、コンテナの標準入出力に attach する。
-type DockerConsole struct {
-	Socket    string
-	Container string
-	mu        sync.Mutex
+func NewRelayConsole(url string) *RelayConsole {
+	// 内部のネットワークだけで話すので、プロキシの設定は見ない。行を流す時間が長いので、全体の期限は context で持つ
+	tr := &http.Transport{DisableKeepAlives: true, ResponseHeaderTimeout: 30 * time.Second}
+	return &RelayConsole{URL: strings.TrimRight(url, "/"), hc: &http.Client{Transport: tr}}
 }
 
-func (d *DockerConsole) Run(ctx context.Context, cmd string, timeout time.Duration, done func(string) bool) ([]string, error) {
-	// 1 度に 1 つのコマンドだけ (出力が混ざらないように)
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "unix", d.Socket)
+func (c *RelayConsole) Run(ctx context.Context, cmd string, timeout time.Duration, done func(string) bool) ([]string, error) {
+	body, err := json.Marshal(relayRequest{Cmd: cmd, TimeoutMS: timeout.Milliseconds()})
 	if err != nil {
-		return nil, fmt.Errorf("docker socket: %w", err)
-	}
-	defer conn.Close()
-
-	req := fmt.Sprintf("POST /containers/%s/attach?stream=1&stdin=1&stdout=1&stderr=1 HTTP/1.1\r\nHost: docker\r\nUpgrade: tcp\r\nConnection: Upgrade\r\nContent-Length: 0\r\n\r\n", d.Container)
-	if _, err := io.WriteString(conn, req); err != nil {
 		return nil, err
 	}
-	br := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(br, nil)
+	// 返ると接続が切れて、中継の attach も終わる
+	rctx, cancel := context.WithTimeout(ctx, timeout+relayGrace)
+	defer cancel()
+	req, err := http.NewRequestWithContext(rctx, http.MethodPost, c.URL+"/run", bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("docker attach: %w", err)
-	}
-	if resp.StatusCode != http.StatusSwitchingProtocols && resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("docker attach: HTTP %d", resp.StatusCode)
-	}
-	var stream io.Reader = br
-	if strings.Contains(resp.Header.Get("Content-Type"), "multiplexed") {
-		stream = &demux{r: br}
-	}
-	return runOnStream(ctx, conn, stream, cmd, timeout, done)
-}
-
-// runOnStream は、つながった入出力に cmd を送り、出た行を集める (試験でも使う)。
-func runOnStream(ctx context.Context, w io.Writer, r io.Reader, cmd string, timeout time.Duration, done func(string) bool) ([]string, error) {
-	lines := make(chan string, 256)
-	go func() {
-		defer close(lines)
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 64*1024), 1024*1024)
-		for sc.Scan() {
-			if l := cleanLine(sc.Text()); l != "" {
-				select {
-				case lines <- l:
-				default: // 読む側が遅いときは捨てる
-				}
-			}
-		}
-	}()
-
-	// 端末の描き直しが落ち着くのを少し待つ
-	settle := time.NewTimer(400 * time.Millisecond)
-	defer settle.Stop()
-drain:
-	for {
-		select {
-		case <-lines:
-		case <-settle.C:
-			break drain
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-
-	if _, err := io.WriteString(w, cmd+"\r"); err != nil {
 		return nil, err
 	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: コンソールの中継につなげません: %v", ErrUnavailable, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, relayError(resp)
+	}
+
 	var out []string
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	for {
-		select {
-		case l, ok := <-lines:
-			if !ok {
-				return out, nil
-			}
-			out = append(out, l)
-			if done != nil && done(l) {
-				return out, nil
-			}
-		case <-deadline.C:
-			if done != nil {
-				return out, fmt.Errorf("timeout waiting for output of %q", cmd)
-			}
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 64*1024), consoleMaxLine)
+	for sc.Scan() {
+		l := sc.Text()
+		out = append(out, l)
+		if len(out) > maxRunLines {
+			out = out[1:]
+		}
+		if done != nil && done(l) {
 			return out, nil
-		case <-ctx.Done():
-			return out, ctx.Err()
 		}
+	}
+	err = sc.Err()
+	switch {
+	case ctx.Err() != nil:
+		return out, ctx.Err()
+	case done == nil:
+		return out, nil // 200 なら、コマンドは送ってある
+	case err != nil:
+		return out, fmt.Errorf("console stream of %q: %w", cmd, io.ErrUnexpectedEOF)
+	default:
+		return out, fmt.Errorf("timeout waiting for output of %q", cmd)
 	}
 }
 
-// demux は tty でないコンテナの、多重化された出力 (8 バイトの頭 + 本体) を 1 本にほどく。
-type demux struct {
-	r    io.Reader
-	left int
-}
-
-func (d *demux) Read(p []byte) (int, error) {
-	for d.left == 0 {
-		var h [8]byte
-		if _, err := io.ReadFull(d.r, h[:]); err != nil {
-			return 0, err
-		}
-		d.left = int(binary.BigEndian.Uint32(h[4:]))
+// relayError は、中継が断ったときのエラー。窓口の状態コードに合わせて分ける。
+func relayError(resp *http.Response) error {
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	msg := oneLine(string(b), 200)
+	switch resp.StatusCode {
+	case http.StatusForbidden:
+		return fmt.Errorf("%w: コンソールの中継が断りました: %s", ErrForbidden, msg)
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable:
+		return fmt.Errorf("%w: コンソールの中継: %s", ErrUnavailable, msg)
 	}
-	if len(p) > d.left {
-		p = p[:d.left]
-	}
-	n, err := d.r.Read(p)
-	d.left -= n
-	return n, err
+	return fmt.Errorf("console relay: HTTP %d: %s", resp.StatusCode, msg)
 }
 
 // ---- よく使うコマンド ----
@@ -153,10 +107,20 @@ func (d *demux) Read(p []byte) (int, error) {
 // Ops はサーバーに送るコマンドの組み立てと、返事の読み取り。
 type Ops struct{ C Console }
 
+// コンソールの行は、プレイヤーの発言も混ざる。発言には <名前> などが頭に付くので、判定の文言は、行の頭 (端末のプロンプトの残りと、時刻とレベル) の直後だけで見る。
+const (
+	linePrompt = `^(?:>\s*)*`
+	logPrefix  = linePrompt + `\[\d{2}:\d{2}:\d{2} INFO\]: `
+	// BlueMap の状態は複数行の出力で、2 行目からは時刻が付かず、頭に印が 1 文字付く
+	blueMapPrefix = linePrompt + `(?:\[\d{2}:\d{2}:\d{2} INFO\]: )?(?:\S )?`
+)
+
 var (
-	savedRE    = regexp.MustCompile(`(?i)saved the (game|world)|flushed`)
-	rollbackOK = regexp.MustCompile(`(?i)rollback completed`)
-	rollbackNG = regexp.MustCompile(`(?i)rollback (failed|cancel+ed)|coreprotect.*no data found`)
+	savedRE       = regexp.MustCompile(logPrefix + `(?i:saved the (?:game|world)|flushed)`)
+	rollbackOK    = regexp.MustCompile(logPrefix + `(?i:CoreProtect - Rollback completed for) "([^"]+)"`)
+	rollbackNG    = regexp.MustCompile(logPrefix + `(?:CoreProtect - )?(?i:rollback (?:failed|cancel+ed)|rollback or restore aborted|a rollback/restore is already in progress|no (?:results|data) found|database busy)`)
+	blueMapIdleRE = regexp.MustCompile(blueMapPrefix + `(?i:\d+ render-threads are idle)`)
+	blueMapDoneRE = regexp.MustCompile(blueMapPrefix + `(?i:map (\S+) is updated)`)
 )
 
 // SaveFlush はワールドをディスクに書き出す (BlueMap はディスクの region ファイルを読むので)。
@@ -183,11 +147,10 @@ func (o Ops) BlueMapIdle(ctx context.Context, mapID string) (bool, error) {
 func parseBlueMapIdle(lines []string, mapID string) bool {
 	idle, updated := false, false
 	for _, l := range lines {
-		ll := strings.ToLower(l)
-		if strings.Contains(ll, "render-threads are idle") {
+		if blueMapIdleRE.MatchString(l) {
 			idle = true
 		}
-		if strings.Contains(ll, "map "+strings.ToLower(mapID)+" is updated") {
+		if m := blueMapDoneRE.FindStringSubmatch(l); m != nil && strings.EqualFold(m[1], mapID) {
 			updated = true
 		}
 	}
@@ -221,20 +184,39 @@ func (o Ops) WaitBlueMap(ctx context.Context, mapID string, max time.Duration) e
 }
 
 // RollbackCmd は CoreProtect のロールバックのコマンド。時間は「いまからさかのぼる秒」。
+// 名前かワールドが安全な形でないときは空 (コンソールに渡さず、報告文にも書かない)。
 func RollbackCmd(player string, seconds int, world string) string {
+	if !validName(player) || !validWorld(world) {
+		return ""
+	}
 	return fmt.Sprintf("co rollback u:%s t:%ds r:#%s", player, seconds, world)
 }
 
-// RestoreCmd は、まちがえたときに戻すためのコマンド (報告に書く)。
+// RestoreCmd は、まちがえたときに戻すためのコマンド (報告に書く)。形の決まりは RollbackCmd と同じ。
 func RestoreCmd(player string, seconds int, world string) string {
+	if !validName(player) || !validWorld(world) {
+		return ""
+	}
 	return fmt.Sprintf("co restore u:%s t:%ds r:#%s", player, seconds, world)
 }
 
-// Rollback はコマンドを送り、「完了」の行まで待つ。返した行は報告に使う。
-func (o Ops) Rollback(ctx context.Context, player string, seconds int, world string) ([]string, error) {
-	var failed bool
-	lines, err := o.C.Run(ctx, RollbackCmd(player, seconds, world), 10*time.Minute, func(l string) bool {
-		if rollbackOK.MatchString(l) {
+var errRollbackFailed = errors.New("CoreProtect がロールバックの失敗を返しました")
+
+// rollbackFinished は、その人のロールバックが終わったという CoreProtect の行か。
+func rollbackFinished(line, player string) bool {
+	m := rollbackOK.FindStringSubmatch(line)
+	return m != nil && strings.EqualFold(m[1], player)
+}
+
+// Rollback はコマンドを送り、「完了」の行まで待つ。本当に戻ったかは、呼ぶ側がデータベースで確かめる (rollbackVerified)。
+func (o Ops) Rollback(ctx context.Context, player string, seconds int, world string) error {
+	cmd := RollbackCmd(player, seconds, world)
+	if cmd == "" {
+		return fmt.Errorf("%w: 名前 %q かワールド %q はコンソールに安全に渡せません", ErrForbidden, player, world)
+	}
+	failed := false
+	_, err := o.C.Run(ctx, cmd, 10*time.Minute, func(l string) bool {
+		if rollbackFinished(l, player) {
 			return true
 		}
 		if rollbackNG.MatchString(l) {
@@ -244,19 +226,15 @@ func (o Ops) Rollback(ctx context.Context, player string, seconds int, world str
 		return false
 	})
 	if err == nil && failed {
-		err = fmt.Errorf("rollback failed: %s", strings.Join(tail(lines, 3), " / "))
+		err = errRollbackFailed
 	}
-	return lines, err
-}
-
-func (o Ops) Kick(ctx context.Context, player, reason string) error {
-	_, err := o.C.Run(ctx, fmt.Sprintf("kick %s %s", player, reason), 5*time.Second, nil)
 	return err
 }
 
-func tail(a []string, n int) []string {
-	if len(a) > n {
-		return a[len(a)-n:]
+func (o Ops) Kick(ctx context.Context, player, reason string) error {
+	if !validName(player) {
+		return fmt.Errorf("%w: 名前 %q はコンソールに安全に渡せません", ErrForbidden, player)
 	}
-	return a
+	_, err := o.C.Run(ctx, fmt.Sprintf("kick %s %s", player, reason), sendOnlyTimeout, nil)
+	return err
 }

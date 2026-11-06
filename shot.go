@@ -4,13 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
+	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
 )
 
@@ -159,9 +164,11 @@ func weightedRadius(cols []Column, cx, cz, p float64) float64 {
 }
 
 // Shooter は BlueMap の web を開いて、画面を撮る (Chromium)。
+// 本番のブラウザは別のコンテナ (BROWSER_URL) で動かす。プレイヤーの置いた看板を読むページを開くので、toro-guard と同じ権限に置かない。
 type Shooter struct {
 	URL     string
-	Resolve string // "toro-edge:80" のように、URL の名前をこの先へ向ける
+	Browser string // BROWSER_URL。空なら、手元の Chromium を起動する (開発用)
+	Resolve string // 手元の Chromium だけ。"toro-edge:80" のように、URL の名前をこの先へ向ける
 	Chrome  string
 	Flags   []string
 	W, H    int
@@ -177,7 +184,7 @@ func NewShooter(c *Config) *Shooter {
 			flags = append(flags, f)
 		}
 	}
-	return &Shooter{URL: c.BlueMapURL, Resolve: c.BlueMapResolve, Chrome: c.ChromePath, Flags: flags, W: c.ShotWidth, H: c.ShotHeight, MaxWait: c.ShotSettle}
+	return &Shooter{URL: c.BlueMapURL, Browser: c.BrowserURL, Resolve: c.BlueMapResolve, Chrome: c.ChromePath, Flags: flags, W: c.ShotWidth, H: c.ShotHeight, MaxWait: c.ShotSettle}
 }
 
 // tilesLoadedJS は、いま見えている範囲のタイルが全部読み終わったか。
@@ -194,8 +201,13 @@ const tilesLoadedJS = `(() => {
   return n > 0 && loading === 0;
 })()`
 
-// hideUICSS は、操作の部品 (#app 以下) を消して、地図だけを撮る。
-const hideUICSS = `#app{display:none!important}`
+// prepareShotJS は、撮る直前に看板を消し (プレイヤーの選んだ画像を証拠に写さない)、操作の部品 (#app 以下) を隠して、地図だけにする。
+const prepareShotJS = `(() => {
+  if (window.marumasign3d) window.marumasign3d.disable();
+  const s = document.createElement('style');
+  s.textContent = '#app{display:none!important}';
+  document.head.appendChild(s);
+})()`
 
 // Pillar は、壊された 1 列 (x, z) とその高さ。画面では、縦の赤い線になる。
 type Pillar struct {
@@ -292,8 +304,83 @@ func (a *Annot) overlayArg() map[string]any {
 	return arg
 }
 
-// Shot は地図を開いて、タイルが読み終わるまで待ち、(ann があれば印を重ねて) PNG を out に書く。
-func (s *Shooter) Shot(ctx context.Context, mapID string, cam Cam, out string, ann *Annot) error {
+// browserPathRE は、DevTools のブラウザの接続先のパス。
+var browserPathRE = regexp.MustCompile(`^/devtools/browser/[0-9A-Za-z-]{1,64}$`)
+
+// remoteBrowserURL は、ブラウザのコンテナの /json/version から、接続先のパスだけを読む。
+// あちらはプレイヤーの看板を読む側なので信用しない: 答えのホストは使わず、転送も追わず、形がおかしければエラーにする。
+func remoteBrowserURL(ctx context.Context, browser string) (string, error) {
+	u, err := url.Parse(browser)
+	if err != nil || u.Host == "" {
+		return "", fmt.Errorf("BROWSER_URL の形が正しくありません")
+	}
+	if browserPathRE.MatchString(u.Path) {
+		return browser, nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+u.Host+"/json/version", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Host = "localhost" // Chrome は、IP か localhost の Host しか受けない
+	hc := &http.Client{
+		Timeout:       10 * time.Second,
+		Transport:     &http.Transport{DisableKeepAlives: true},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	res, err := hc.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("browser: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("browser: /json/version: HTTP %d", res.StatusCode)
+	}
+	var v struct {
+		WS string `json:"webSocketDebuggerUrl"`
+	}
+	if err := json.NewDecoder(io.LimitReader(res.Body, 64<<10)).Decode(&v); err != nil {
+		return "", fmt.Errorf("browser: /json/version を読めません: %w", err)
+	}
+	w, err := url.Parse(v.WS)
+	if err != nil || !browserPathRE.MatchString(w.Path) {
+		return "", fmt.Errorf("browser: /json/version の接続先の形が正しくありません")
+	}
+	return (&url.URL{Scheme: "ws", Host: u.Host, Path: w.Path}).String(), nil
+}
+
+// openRemote は、別のコンテナのブラウザに、1 枚分の新しいブラウザコンテキストを作る。閉じると、Cookie もキャッシュも残らない。
+func (s *Shooter) openRemote(ctx context.Context) (context.Context, func(), error) {
+	ws, err := remoteBrowserURL(ctx, s.Browser)
+	if err != nil {
+		return nil, nil, err
+	}
+	actx, cancelA := chromedp.NewRemoteAllocator(ctx, ws)
+	cctx, cancelC := chromedp.NewContext(actx, chromedp.WithNewBrowserContext())
+	closeAll := func() { cancelC(); cancelA() }
+	err = chromedp.Run(cctx)
+	if err == nil {
+		return cctx, closeAll, nil
+	}
+	if !strings.Contains(err.Error(), "no browser is open") {
+		closeAll()
+		return nil, nil, fmt.Errorf("browser: %w", err)
+	}
+	// フル版の Chrome は、ウィンドウの無いコンテキストに、新しいウィンドウでしかタブを作れない (headless-shell は newWindow を受けない)
+	c := chromedp.FromContext(cctx)
+	id, err := target.CreateTarget("about:blank").WithBrowserContextID(c.BrowserContextID).WithNewWindow(true).Do(cdp.WithExecutor(cctx, c.Browser))
+	if err != nil {
+		closeAll()
+		return nil, nil, fmt.Errorf("browser: %w", err)
+	}
+	tctx, cancelT := chromedp.NewContext(cctx, chromedp.WithTargetID(id))
+	return tctx, func() { cancelT(); closeAll() }, nil
+}
+
+// openBrowser は、撮影 1 回分のブラウザの context を作る。返す関数で閉じる。
+func (s *Shooter) openBrowser(ctx context.Context) (context.Context, func(), error) {
+	if s.Browser != "" {
+		return s.openRemote(ctx)
+	}
 	opts := append([]chromedp.ExecAllocatorOption{}, chromedp.DefaultExecAllocatorOptions[:]...)
 	opts = append(opts, chromedp.WindowSize(s.W, s.H))
 	if s.Chrome != "" {
@@ -313,14 +400,32 @@ func (s *Shooter) Shot(ctx context.Context, mapID string, cam Cam, out string, a
 		}
 	}
 	actx, cancelA := chromedp.NewExecAllocator(ctx, opts...)
-	defer cancelA()
 	cctx, cancelC := chromedp.NewContext(actx)
-	defer cancelC()
+	return cctx, func() { cancelC(); cancelA() }, nil
+}
+
+// pageURL は撮る地図の URL。?marumasign3d=off で、看板の処理を始めさせない (プレイヤーの指定した画像や動画を、ブラウザに読ませない)。
+func (s *Shooter) pageURL(mapID string, cam Cam) string {
+	return strings.TrimRight(s.URL, "/") + "/?marumasign3d=off" + cam.Hash(mapID)
+}
+
+// Shot は地図を開いて、タイルが読み終わるまで待ち、(ann があれば印を重ねて) PNG を out に書く。
+func (s *Shooter) Shot(ctx context.Context, mapID string, cam Cam, out string, ann *Annot) error {
+	cctx, closeBrowser, err := s.openBrowser(ctx)
+	if err != nil {
+		return err
+	}
+	defer closeBrowser()
 	cctx, cancelT := context.WithTimeout(cctx, s.MaxWait+90*time.Second)
 	defer cancelT()
 
-	target := strings.TrimRight(s.URL, "/") + "/" + cam.Hash(mapID)
-	if err := chromedp.Run(cctx, chromedp.Navigate(target), chromedp.WaitVisible("#map-container", chromedp.ByQuery)); err != nil {
+	target := s.pageURL(mapID, cam)
+	// 画面の大きさは、起動のフラグではなく emulation で決める (別のコンテナのブラウザのフラグは変えられない)
+	if err := chromedp.Run(cctx,
+		chromedp.EmulateViewport(int64(s.W), int64(s.H)),
+		chromedp.Navigate(target),
+		chromedp.WaitVisible("#map-container", chromedp.ByQuery),
+	); err != nil {
 		return fmt.Errorf("open %s: %w", target, err)
 	}
 
@@ -362,7 +467,7 @@ func (s *Shooter) Shot(ctx context.Context, mapID string, cam Cam, out string, a
 
 	var buf []byte
 	if err := chromedp.Run(cctx,
-		chromedp.Evaluate(`(() => { const s = document.createElement('style'); s.textContent = `+"`"+hideUICSS+"`"+`; document.head.appendChild(s); })()`, nil),
+		chromedp.Evaluate(prepareShotJS, nil),
 		chromedp.Sleep(1500*time.Millisecond),
 		chromedp.FullScreenshot(&buf, 100), // 100 は PNG
 	); err != nil {

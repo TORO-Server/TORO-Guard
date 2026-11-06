@@ -217,8 +217,17 @@ func (a *AI) ReviewChat(ctx context.Context, msgs []ChatMsg, names map[int]strin
 			continue
 		}
 		f.Summary = safeChat(f.Summary, 120)
-		f.Category = strings.ToLower(strings.TrimSpace(f.Category))
+		f.Category = chatCategory(f.Category)
 		ok = append(ok, f)
 	}
 	return ok, nil
+}
+
+// chatCategory は、AI の答えの category を、決めた言葉だけにする (報告文にそのまま載るので)。
+func chatCategory(c string) string {
+	switch c = strings.ToLower(strings.TrimSpace(c)); c {
+	case "harassment", "sexual", "hate", "spam", "advertising", "other":
+		return c
+	}
+	return "other"
 }

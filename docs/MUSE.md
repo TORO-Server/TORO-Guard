@@ -35,6 +35,7 @@ Muse ──▶ mcp.torosaba.net (TORO Server) ──▶ toro-guard の窓口
 2. TORO-MCP (mcp.torosaba.net) に `GUARD_CONTROL_URL=http://toro-guard:8090` を渡す (これを渡すと、管理用のツールが有効になる)。
 3. **auth に `DISCORD_BOT_TOKEN` が要る。** auth は、トークンの確認のたびに (60 秒だけ覚えて)、Bot で**いまの Discord のロール**を調べて返す。Bot トークンが無いと、`roles_source` が `live` にならず、窓口も MCP も、Admin と認めない (安全な側に倒す)。
 4. 管理用のツールを使えるのは、いまのロールが `ADMIN_ROLE_IDS` (既定: TORO サーバーの Owner と Admin) のどれかの人だけ。ロールを外せば、最長 60 秒で使えなくなる。トークンの作り直しは要らない。
+5. OAuth のトークンは、scope に `mcp` が要る (`read` だけに同意したトークンは、窓口が 403 で断る)。本人が発行した 90 日トークンには scope が無く、ロールだけで判断する。
 
 ```
 Muse ─(OAuth 2.0 のトークン)→ mcp.torosaba.net ─(同じトークン)→ toro-guard ─→ auth /introspect (いまの Discord のロール)
@@ -76,7 +77,7 @@ Muse に次を頼む (間隔は、好みで。`10m` など。Muse が定期タ�
 > 1. toro-server の `guard_list_incidents` で、確認待ち (pending) の事件を見る。無ければ、何も書かずに終わる。
 > 2. 事件ごとに `guard_get_incident` で報告文を読み、`guard_get_image` で画像 (damage.png と closeup.png) を見る。必要なら `guard_player_activity` で、その人の最近の動き (コマンドの有無、壊した数) を見る。
 > 3. 次の決まりで判断する。
->    - **荒らし**: 建物や地形を、短い時間に、広い範囲で壊している。コマンド (WorldEdit など) を使っていない。→ `guard_rollback` → (終わったら `guard_get_incident` で rolled_back が true) → `guard_report_incident`。
+>    - **荒らし**: 建物や地形を、短い時間に、広い範囲で壊している。コマンド (WorldEdit など) を使っていない (報告文の「検知」に「編集コマンドの使用あり」があれば、権限と成否は確かめていないので、私に知らせる)。→ `guard_rollback` → (終わったら `guard_get_incident` で rolled_back が true) → `guard_report_incident`。
 >    - **正当な作業の疑い・判断できない**: 何もせず、事件の ID と理由を、私に知らせる。
 >    - **荒らしではないと確かめた**: `guard_dismiss_incident` で、理由を付けて却下する。
 >    - チャットのスパム (kind=chat): 内容を読み、スパムか暴言なら `guard_report_incident`。ミュートは、繰り返しているときだけ `guard_mute_player`。
@@ -90,11 +91,11 @@ Muse に次を頼む (間隔は、好みで。`10m` など。Muse が定期タ�
 | ツール | 内容 |
 | --- | --- |
 | `guard_status` `guard_list_incidents` `guard_get_incident` `guard_get_image` | 状態・事件の一覧・報告文・証拠の画像 |
-| `guard_report_incident` `guard_rollback` `guard_dismiss_incident` | 通報 / ロールバック (裏で動く) / 却下 |
+| `guard_report_incident` `guard_rollback` `guard_dismiss_incident` | 通報 (却下した事件はできない) / ロールバック (裏で動く。事件の始まりから 24 時間まで) / 却下 |
 | `guard_player_activity` `guard_recent_chat` | 最近の動き・チャット |
-| `guard_mute_player` `guard_kick_player` | ミュート (`CHAT_MUTE_CMD` を設定したとき) / キック |
-| `guard_map_screenshot` `guard_get_screenshot` | 指定した場所の BlueMap の撮影を始める / 撮れた画像を取る |
-| `discord_search_tools` `discord_call_tool` | TORO の Discord ボットで、許可した操作 (読む・投稿・タグ付け) |
+| `guard_mute_player` `guard_kick_player` | ミュート (`CHAT_MUTE_CMD` を設定したとき) / キック。成否だけを返す |
+| `guard_map_screenshot` `guard_get_screenshot` | 指定した場所の BlueMap の撮影を始める / 撮れた画像を取る (看板は写らない) |
+| `discord_search_tools` `discord_call_tool` | TORO の Discord ボットで、許可した操作 (読む・投稿・タグ付け)。チャンネルを指定する操作は、通報フォーラムとそのスレッドだけ。タグの変更のほかは、チャンネルを変えられない |
 
 ## 守っていること
 
@@ -102,8 +103,10 @@ Muse に次を頼む (間隔は、好みで。`10m` など。Muse が定期タ�
 - 共有の秘密は無い。窓口 (toro-guard) は、利用者のトークンを auth に尋ねて、Admin かを**自分で**確かめる (TORO-MCP の判断は、ツールを見せるかどうかだけ)。auth に尋ねられないとき、またはロールを確かめられないときは、権限を渡さない (503)。
 - Discord のトークンは、Muse にも TORO-MCP にも渡らない。toro-guard が、DiscordSRV の設定から読んで使う。
 - 信頼する人と op には、ロールバック・ミュート・キックをしない。
-- 操作はすべて、頼んだ人の名前つきで `audit.jsonl` に残り、Discord の操作は、監査ログの理由にも「(by 名前)」が付く。
+- 操作はすべて、頼んだ人の名前つきで `audit.jsonl` に残り、Discord の操作は、ツール名・チャンネル・本文の SHA-256 も残る。Discord の監査ログの理由は、頼んだ人の名前から始まる。
+- 窓口からの投稿は、だれにも通知しない (`allowed_mentions` を窓口が固定する)。確認した人のメモと、プレイヤーの書いたコマンドは、`@` とインラインコードの区切りとマスクリンクを無効にしてから載せる。
 - 利用者が書いた文章 (発言・Discord の本文・名前) は、「信頼できない入力」の注意を付けて返す。それでも、AI は、書かれた指示に従う可能性がある。**最初は、書き込みを Ask にして、人の確認を挟む。**
+- `ALLOWED_TOOLS` は Muse の側の決まりで、窓口からは同じトークンに見える。読み取りと通報だけのトークンを窓口で強制するには、TORO-Auth と TORO-MCP の変更も要る (まだしていない)。
 
 ## いまの状態 (2026-11-04)
 

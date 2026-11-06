@@ -161,12 +161,21 @@ func (m *MCP) Discord(ctx context.Context, c DiscordCall) (string, error) {
 		args["toolName"] = c.Tool
 		return m.Tool(ctx, "discord_call_tool", args)
 	}
-	// 個別のツールとして登録されているときは、パスの値をそのまま引数に平らにする
+	// 個別のツールとして登録されているときは、パスの値を引数に平らにする。予約の引数 (トークンや添付) は上書きさせない
 	for k, v := range c.PathParams {
+		if mcpReservedArgs[k] {
+			return "", fmt.Errorf("mcp %s: パスの値に %q は使えません", c.Tool, k)
+		}
 		args[k] = v
 	}
 	delete(args, "pathParams")
 	return m.Tool(ctx, c.Tool, args)
+}
+
+// mcpReservedArgs は、Discord が組み立てる引数の名前。
+var mcpReservedArgs = map[string]bool{
+	"pathParams": true, "body": true, "queryParams": true, "files": true, "fields": true,
+	"authOverride": true, "auditLogReason": true, "toolName": true,
 }
 
 func oneLine(s string, n int) string {

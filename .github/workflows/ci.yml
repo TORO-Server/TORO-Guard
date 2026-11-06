@@ -17,6 +17,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -30,9 +31,13 @@ jobs:
 
       - run: go test -race ./...
 
+      # 既知の脆弱性 (Go の脆弱性データベース)。実際に呼んでいる関数に届くものだけを報告する
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
   image:
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
