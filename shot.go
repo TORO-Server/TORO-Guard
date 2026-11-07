@@ -17,6 +17,7 @@ import (
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
+	"github.com/chromedp/chromedp/remote"
 )
 
 // Cam は BlueMap のカメラ。URL の # のあとの値と同じ意味 (BlueMapApp.ts の updatePageAddress)。
@@ -354,10 +355,10 @@ func (s *Shooter) openRemote(ctx context.Context) (context.Context, func(), erro
 	if err != nil {
 		return nil, nil, err
 	}
-	actx, cancelA := chromedp.NewRemoteAllocator(ctx, ws)
+	actx, cancelA := remote.NewAllocator(ctx, ws)
 	cctx, cancelC := chromedp.NewContext(actx, chromedp.WithNewBrowserContext())
 	closeAll := func() { cancelC(); cancelA() }
-	err = chromedp.Run(cctx)
+	err = chromedp.Do(cctx)
 	if err == nil {
 		return cctx, closeAll, nil
 	}
@@ -367,12 +368,17 @@ func (s *Shooter) openRemote(ctx context.Context) (context.Context, func(), erro
 	}
 	// フル版の Chrome は、ウィンドウの無いコンテキストに、新しいウィンドウでしかタブを作れない (headless-shell は newWindow を受けない)
 	c := chromedp.FromContext(cctx)
-	id, err := target.CreateTarget("about:blank").WithBrowserContextID(c.BrowserContextID).WithNewWindow(true).Do(cdp.WithExecutor(cctx, c.Browser))
+	newWindow := true
+	created, err := cdp.Call(cctx, c.Browser, target.CreateTarget, target.CreateTargetParams{
+		URL:              "about:blank",
+		BrowserContextID: c.BrowserContextID,
+		NewWindow:        &newWindow,
+	})
 	if err != nil {
 		closeAll()
 		return nil, nil, fmt.Errorf("browser: %w", err)
 	}
-	tctx, cancelT := chromedp.NewContext(cctx, chromedp.WithTargetID(id))
+	tctx, cancelT := chromedp.NewContext(cctx, chromedp.WithTargetID(created.TargetID))
 	return tctx, func() { cancelT(); closeAll() }, nil
 }
 
@@ -421,10 +427,10 @@ func (s *Shooter) Shot(ctx context.Context, mapID string, cam Cam, out string, a
 
 	target := s.pageURL(mapID, cam)
 	// 画面の大きさは、起動のフラグではなく emulation で決める (別のコンテナのブラウザのフラグは変えられない)
-	if err := chromedp.Run(cctx,
+	if err := chromedp.Do(cctx,
 		chromedp.EmulateViewport(int64(s.W), int64(s.H)),
 		chromedp.Navigate(target),
-		chromedp.WaitVisible("#map-container", chromedp.ByQuery),
+		chromedp.WaitVisible(chromedp.CSS("#map-container")),
 	); err != nil {
 		return fmt.Errorf("open %s: %w", target, err)
 	}
@@ -433,8 +439,8 @@ func (s *Shooter) Shot(ctx context.Context, mapID string, cam Cam, out string, a
 	deadline := time.Now().Add(s.MaxWait)
 	stable := 0
 	for time.Now().Before(deadline) {
-		var ok bool
-		if err := chromedp.Run(cctx, chromedp.Evaluate(tilesLoadedJS, &ok)); err != nil {
+		ok, err := chromedp.Run(cctx, chromedp.Evaluate[bool](tilesLoadedJS))
+		if err != nil {
 			return err
 		}
 		if ok {
@@ -458,19 +464,21 @@ func (s *Shooter) Shot(ctx context.Context, mapID string, cam Cam, out string, a
 			return err
 		}
 		// 印が描けなくても、印の無い画面は撮る (無いよりよい)。結果は LastOverlay に残す
-		var res string
-		if err := chromedp.Run(cctx, chromedp.Evaluate(overlayJS+"("+string(arg)+")", &res)); err != nil {
+		res, err := chromedp.Run(cctx, chromedp.Evaluate[string](overlayJS+"("+string(arg)+")"))
+		if err != nil {
 			res = "failed: " + err.Error()
 		}
 		s.LastOverlay = res
 	}
 
-	var buf []byte
-	if err := chromedp.Run(cctx,
-		chromedp.Evaluate(prepareShotJS, nil),
+	if err := chromedp.Do(cctx,
+		chromedp.Evaluate[chromedp.Void](prepareShotJS),
 		chromedp.Sleep(1500*time.Millisecond),
-		chromedp.FullScreenshot(&buf, 100), // 100 は PNG
 	); err != nil {
+		return err
+	}
+	buf, err := chromedp.Run(cctx, chromedp.FullScreenshot(100)) // 100 は PNG
+	if err != nil {
 		return err
 	}
 	return os.WriteFile(out, buf, 0o644)
